@@ -57,9 +57,9 @@ AUTHOR_META_KEYS = [
     ("div", {"class": re.compile(r"author", re.I)}),
 ]
 
-# Expanded nav-like detector
+# Expanded nav-like detector (names + classes/ids)
 NAV_LIKE = re.compile(
-    r"(nav|menu|breadcrumb|footer|header|toc|table-of-contents|sidebar|aside|"
+    r"(nav|menu|breadcrumb|footer|toc|table-of-contents|sidebar|aside|"
     r"pagination|pager|next-prev|share|social|subscribe|cookie|banner|"
     r"newsletter|promo|advert|ad-)",
     re.I
@@ -151,10 +151,6 @@ def top_terms(text: str, n=20):
     cnt = Counter(tokens)
     return cnt.most_common(n)
 
-def token_set_from_text(text: str):
-    toks = {t.lower() for t in re.findall(r"[a-zA-ZÀ-ÖØ-öø-ÿ]{3,}", text) if t.lower() not in STOPWORDS}
-    return toks
-
 def token_set_from_url_path(url: str):
     parsed = urllib.parse.urlparse(url)
     path = parsed.path.lower()
@@ -179,7 +175,7 @@ def render_with_js(url: str, timeout=ABS_TIMEOUT) -> str:
         raise RuntimeError("requests-html not installed")
     s = HTMLSession()
     r = s.get(url, headers=HEADERS, timeout=timeout)
-    # Render JS (pyppeteer). May fail on some hosts; fallback handled upstream.
+    # Render JS (pyppeteer). May fail; fallback handled upstream.
     r.html.render(timeout=timeout*1000, sleep=1)
     return r.html.html
 
@@ -188,7 +184,7 @@ def fetch_html(url: str, use_js: bool) -> str:
         try:
             return render_with_js(url)
         except Exception:
-            pass  # fallback to non-JS fetch
+            pass  # fallback
     r = requests.get(url, headers=HEADERS, timeout=ABS_TIMEOUT)
     r.raise_for_status()
     return r.text
@@ -217,8 +213,8 @@ def extract_main_content(soup: BeautifulSoup):
         best = max(candidates, key=lambda c: len(c.get_text(" ", strip=True)))
         return best
     body = soup.body or soup
-    # strip obvious nav/footer/aside
-    for tag in body.find_all(["nav","footer","aside","header"]):
+    # strip obvious nav/footer/aside (leave header; treat global header separately later)
+    for tag in body.find_all(["nav","footer","aside"]):
         tag.extract()
     for tag in body.find_all(True, class_=NAV_LIKE):
         tag.extract()
@@ -227,15 +223,35 @@ def extract_main_content(soup: BeautifulSoup):
     return body
 
 def is_in_navigation_context(tag) -> bool:
-    """Skip links inside nav/header/footer/aside or elements with nav-like classes/ids."""
+    """
+    Skip links inside true navigation/utility regions.
+    - Treat <nav>, <footer>, <aside> as navigation.
+    - Treat <header> as navigation ONLY if it's a direct child of <body> (global site header).
+    - Also skip ancestors whose class/id matches NAV_LIKE.
+    - If we hit <article> or role='main', we assume we're in content and stop checking.
+    """
     for parent in tag.parents:
         name = getattr(parent, "name", None)
-        if name in {"nav", "footer", "header", "aside"}:
+        if not name:
+            continue
+
+        # Stop early if we've reached the content root
+        if name in {"article", "main"} or (parent.get("role") == "main") or (parent.get("itemprop") == "articleBody"):
+            return False
+
+        if name in {"nav", "footer", "aside"}:
             return True
+        if name == "header":
+            # Only treat as nav if global (direct child of body)
+            gp = getattr(parent, "parent", None)
+            if gp is not None and getattr(gp, "name", None) == "body":
+                return True
+
         cls = " ".join(parent.get("class") or [])
         pid = parent.get("id") or ""
         if NAV_LIKE.search(cls) or NAV_LIKE.search(pid):
             return True
+
     return False
 
 def visible_anchor_text(a):
@@ -300,36 +316,45 @@ def analyze_url(url: str, use_js=False, exclude_toc=True, require_nonempty_ancho
     word_count = len(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", full_text))
     reading_ease = flesch_reading_ease(full_text)
 
-    # ----- Links: ANY in-content <a> in main, skip nav/header/footer/aside & nav-like wrappers -----
-    internal_links, external_links, internal_anchor_texts = [], [], []
+    # ----- Link collection (content area) -----
+    def collect_links(root):
+        internal_links, external_links, internal_anchor_texts = [], [], []
+        for a in root.find_all("a", href=True):
+            if is_in_navigation_context(a):
+                continue  # ignore nav/footer/etc.
+            href = absolute_url(a["href"], url)
+            txt = visible_anchor_text(a).lower()
 
-    for a in main.find_all("a", href=True):
-        if is_in_navigation_context(a):
-            continue  # ignore nav/footer/etc.
+            # Optional TOC exclusion
+            if exclude_toc:
+                if href.endswith("#") or urllib.parse.urlparse(href).fragment:
+                    continue
+                # skip ToC-like ancestors
+                chain = []
+                for p in a.parents:
+                    chain.extend(p.get("class") or [])
+                    pid = p.get("id")
+                    if pid: chain.append(pid)
+                if re.search(r"(toc|table-of-contents|jump\-links|page\-contents)", " ".join(chain), re.I):
+                    continue
 
-        href = absolute_url(a["href"], url)
-        txt = visible_anchor_text(a).lower()
-
-        # Optional TOC exclusion: href starting with # or toc-like ancestors
-        if exclude_toc:
-            if href.endswith("#") or urllib.parse.urlparse(href).fragment:
-                # #fragment links
+            if require_nonempty_anchor and not txt:
                 continue
-            # Also skip if a parent looks like a ToC
-            parent_str = " ".join((a.get("class") or [])) + " " + (a.get("id") or "")
-            for p in a.parents:
-                parent_str += " " + " ".join(p.get("class") or []) + " " + (p.get("id") or "")
-            if re.search(r"(toc|table-of-contents|jump\-links|page\-contents)", parent_str, re.I):
-                continue
 
-        if require_nonempty_anchor and not txt:
-            continue  # skip if no meaningful anchor text even after fallbacks
+            if is_internal(href, base_domain):
+                internal_links.append(href)
+                internal_anchor_texts.append(txt)
+            else:
+                external_links.append(href)
+        return internal_links, external_links, internal_anchor_texts
 
-        if is_internal(href, base_domain):
-            internal_links.append(href)
-            internal_anchor_texts.append(txt)
-        else:
-            external_links.append(href)
+    # First pass: within main/article/body (our extracted main)
+    internal_links, external_links, internal_anchor_texts = collect_links(main)
+
+    # Fallback pass: if nothing found (some CMS markups are odd), sweep whole soup
+    if not internal_links and not external_links:
+        all_internal, all_external, all_texts = collect_links(soup)
+        internal_links, external_links, internal_anchor_texts = all_internal, all_external, all_texts
 
     # ----- Internal anchor text quality -----
     descriptive = 0
@@ -365,10 +390,7 @@ def analyze_url(url: str, use_js=False, exclude_toc=True, require_nonempty_ancho
     rest_words = " ".join(full_text.split()[150:])
     lead_terms = set(t for t,_ in top_terms(first_words, n=20))
     all_terms = set(t for t,_ in top_terms(full_text, n=40))
-    if all_terms:
-        coverage = len(lead_terms.intersection(all_terms)) / len(all_terms)
-    else:
-        coverage = 0.0
+    coverage = (len(lead_terms.intersection(all_terms)) / len(all_terms)) if all_terms else 0.0
     lead_cnt = sum(1 for t in re.findall(r"[a-zA-ZÀ-ÖØ-öø-ÿ]{3,}", first_words.lower()) if t in all_terms)
     rest_cnt = sum(1 for t in re.findall(r"[a-zA-ZÀ-ÖØ-öø-ÿ]{3,}", rest_words.lower()) if t in all_terms) or 1
     density_ratio = (lead_cnt / max(1, len(first_words.split()))) / (rest_cnt / max(1, len(rest_words.split())))
@@ -744,7 +766,7 @@ with st.sidebar:
     ua = st.text_input("Custom User-Agent (optional)", value=HEADERS["User-Agent"])
     run = st.button("Run Analysis", type="primary")
     st.markdown("---")
-    st.caption("Counts in-content links in <main>/<article>/<body>, excluding nav/header/footer/aside & nav-like wrappers.")
+    st.caption("Counts in-content links across the page (div/section/li, etc.), excluding global nav/footer/aside & nav-like wrappers. Falls back to full-page sweep if needed.")
 
 if run:
     if not url:
@@ -828,9 +850,9 @@ if run:
         st.subheader("Debug / Raw")
         st.json({
             "url": url,
-            "internal_links_sample": signals["p_internal_links"][:20],
-            "external_links_sample": signals["p_external_links"][:20],
-            "internal_anchor_texts_sample": signals["internal_anchor_texts"][:20],
+            "internal_links_sample": signals["p_internal_links"][:30],
+            "external_links_sample": signals["p_external_links"][:30],
+            "internal_anchor_texts_sample": signals["internal_anchor_texts"][:30],
             "lead_score": round(signals["lead_score"],3),
             "internal_anchor_quality": round(signals["internal_anchor_quality"],3),
             "internal_semantic_score": round(signals["internal_semantic_score"],3),
