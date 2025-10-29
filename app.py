@@ -531,29 +531,60 @@ def analyze_url(url: str, use_js=False, exclude_toc=True, require_nonempty_ancho
     url_has_year = bool(re.search(YEAR_IN_URL, url))
     url_has_date = bool(re.search(DATE_IN_URL, url))
 
-    # ----- Heuristic originality / AI-ish proxies (free) -----
+      # ----- Heuristic originality / AI-ish proxies (free) -----
     tokens = [t.lower() for t in re.findall(r"[a-zA-ZÀ-ÖØ-öø-ÿ]{3,}", full_text)]
-    uniq = len(set(tokens)); total = len(tokens) or 1
-    ttr = uniq / total
-    bigrams = list(zip(tokens, tokens[1:])) if len(tokens) > 1 else []
-    bigram_div = len(set(bigrams))/max(1,len(bigrams))
+    total = len(tokens)
     cnt = Counter(tokens)
-    top_ratio = cnt.most_common(1)[0][1]/total if total>0 else 0.0
+
+    # Type–token ratio with guard
+    uniq = len(cnt)
+    ttr = (uniq / total) if total > 0 else 0.0
+
+    # Bigram diversity with guard
+    if total >= 2:
+        bigrams = list(zip(tokens, tokens[1:]))
+        bigram_total = len(bigrams)
+        bigram_div = (len(set(bigrams)) / bigram_total) if bigram_total > 0 else 0.0
+    else:
+        bigrams = []
+        bigram_div = 0.0
+
+    # Top token ratio with guard
+    if total > 0 and cnt:
+        top_ratio = cnt.most_common(1)[0][1] / total
+    else:
+        top_ratio = 0.0
+
+    # Sentence “burstiness” with guards
     sents = [s.strip() for s in re.split(r"[.!?]+", full_text) if s.strip()]
-    sent_lengths = [len(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", s)) for s in sents] or [0]
-    import statistics as stats
-    try:
-        burst = (stats.stdev(sent_lengths)/max(1, stats.mean(sent_lengths)))
-    except Exception:
+    if sents:
+        sent_lengths = [len(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", s)) for s in sents]
+        try:
+            import statistics as stats
+            mean_len = max(1, stats.mean(sent_lengths))
+            burst = (stats.stdev(sent_lengths) / mean_len) if len(sent_lengths) >= 2 else 0.0
+        except Exception:
+            burst = 0.0
+    else:
         burst = 0.0
+
+    # Lightweight AI-ish phrasing hits (heuristic)
     ai_phrases = [
         "as an ai language model","in conclusion","delve into","moreover","furthermore",
         "this comprehensive guide","utilize","it is important to note that"
     ]
     ai_hits = sum(1 for p in ai_phrases if p in full_text.lower())
-    diversity = 0.35*min(1.0, ttr*3) + 0.25*min(1.0, bigram_div*4) + 0.25*min(1.0, burst) + 0.15*(1.0-max(0.0,(top_ratio-0.03)/0.12))
-    ai_penalty = min(0.25, ai_hits*0.07)
+
+    # Combine (0..1), clamp
+    diversity = (
+        0.35 * min(1.0, ttr * 3.0) +
+        0.25 * min(1.0, bigram_div * 4.0) +
+        0.25 * min(1.0, burst) +
+        0.15 * (1.0 - max(0.0, (top_ratio - 0.03) / 0.12))
+    )
+    ai_penalty = min(0.25, ai_hits * 0.07)
     originality_score = max(0.0, min(1.0, diversity - ai_penalty))
+
 
     # ----- Content Effort score -----
     norm_len = min(1.0, word_count/1800)
