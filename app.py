@@ -170,34 +170,61 @@ def keyword_stuffing_risk(text: str) -> float:
     if ratio >= 0.10: return 1.0
     return (ratio - 0.03) / (0.10 - 0.03)
 
-def render_with_js(url: str, timeout=ABS_TIMEOUT) -> str:
+def render_with_js(url: str, timeout=ABS_TIMEOUT, scrolldown=5) -> str:
     if not HAS_REQ_HTML:
         raise RuntimeError("requests-html not installed")
     s = HTMLSession()
     r = s.get(url, headers=HEADERS, timeout=timeout)
-    # Render JS (pyppeteer). May fail; fallback handled upstream.
-    r.html.render(timeout=timeout*1000, sleep=1)
+    # Give the app time to hydrate + scroll to trigger lazy loads
+    r.html.render(
+        timeout=timeout * 1000,  # ms
+        sleep=1.5,
+        scrolldown=scrolldown,
+        reload=False,
+        keep_page=False
+        # requests-html forwards Chromium flags via env; if needed you can add:
+        # args=["--no-sandbox","--disable-dev-shm-usage","--single-process"]
+    )
     return r.html.html
 
 def fetch_html(url: str, use_js: bool):
-    start = time.time()
-    html_text = None
-    js_render_ms = None
-    if use_js:
+    """
+    Returns (html_text, fetch_ms, html_bytes, did_js)
+    Auto-upgrades to JS render if the first pass looks like CSR shell (tiny body / no content).
+    """
+    import time as _t
+    did_js = False
+
+    def _measure(text, t0):
+        ms = int((_t.time() - t0) * 1000)
+        size = len((text or "").encode("utf-8", errors="ignore"))
+        return ms, size
+
+    # Pass 1: plain GET
+    t0 = _t.time()
+    r = requests.get(url, headers=HEADERS, timeout=ABS_TIMEOUT)
+    r.raise_for_status()
+    html_text = r.text
+    fetch_ms, html_bytes = _measure(html_text, t0)
+
+    # Quick CSR heuristic: tiny HTML or body with very few words
+    soup_probe = BeautifulSoup(html_text, "html.parser")
+    body_text = (soup_probe.body.get_text(" ", strip=True) if soup_probe.body else "")
+    wordish = len(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]{3,}", body_text))
+
+    looks_csr_shell = (html_bytes < 60_000) or (wordish < 120)
+
+    if use_js or looks_csr_shell:
         try:
-            html_text = render_with_js(url)
-            js_render_ms = int((time.time() - start) * 1000)
+            did_js = True
+            t1 = _t.time()
+            html_text = render_with_js(url, timeout=max(ABS_TIMEOUT, 35), scrolldown=6)
+            fetch_ms, html_bytes = _measure(html_text, t1)
         except Exception:
-            html_text = None
-    if html_text is None:
-        start = time.time()
-        r = requests.get(url, headers=HEADERS, timeout=ABS_TIMEOUT)
-        r.raise_for_status()
-        html_text = r.text
-        js_render_ms = int((time.time() - start) * 1000)
-    # Byte size (rough proxy)
-    html_bytes = len(html_text.encode("utf-8", errors="ignore"))
-    return html_text, js_render_ms, html_bytes
+            # keep plain HTML fallback
+            did_js = False
+
+    return html_text, fetch_ms, html_bytes, did_js
 
 def extract_ldjson(soup: BeautifulSoup):
     blobs = []
@@ -354,8 +381,28 @@ def normalize_ms(value, good, poor):
 # Extraction & Analysis
 # -----------------------------
 def analyze_url(url: str, use_js=False, exclude_toc=True, require_nonempty_anchor=False, want_psi=False, psi_key=None):
-    html_text, fetch_ms, html_bytes = fetch_html(url, use_js)
-    soup = BeautifulSoup(html_text, "html.parser")
+    html_text, fetch_ms, html_bytes, did_js = fetch_html(url, use_js)
+soup = BeautifulSoup(html_text, "html.parser")
+
+# If content still looks empty, try <noscript> blocks (some sites ship prerendered content there)
+def _noscript_fallback(soup_):
+    nos = soup_.find_all("noscript")
+    texts = []
+    for n in nos:
+        # parse inner HTML of noscript as HTML again
+        inner = BeautifulSoup(n.decode_contents() or "", "html.parser")
+        texts.append(inner.get_text(" ", strip=True))
+    return " ".join(t for t in texts if t)
+
+probe_text = (soup.body.get_text(" ", strip=True) if soup.body else "")
+if len(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]{3,}", probe_text)) < 80:
+    ns_text = _noscript_fallback(soup)
+    if ns_text and len(ns_text.split()) > 50:
+        # Merge noscript-derived HTML into soup for downstream extractors
+        # (we don't replace the whole soup to preserve head/meta)
+        body = soup.body or soup
+        body.append(BeautifulSoup(f"<div data-noscript-fallback='1'>{ns_text}</div>", "html.parser"))
+
 
     base_domain = get_domain(url)
 
