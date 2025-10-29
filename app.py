@@ -1,4 +1,5 @@
-# app.py — SignalScore Content (SEO Suite) with CSR auto-render, PSI-first UX scoring, and OpenAI keyword relevance
+# app.py — SignalScore Content (SEO Suite)
+# CSR auto-render (requests-html → Pyppeteer fallback) + PSI-first UX scoring + OpenAI keyword relevance
 import re
 import os
 import json
@@ -16,30 +17,39 @@ from dateutil import parser as dateparser
 import streamlit as st
 import pandas as pd
 
-# Optional JS rendering (requests-html / Pyppeteer)
+# Charts
+import plotly.express as px
+
+# Optional JS rendering (fast path)
 try:
     from requests_html import HTMLSession
     HAS_REQ_HTML = True
 except Exception:
     HAS_REQ_HTML = False
 
+# Deep JS rendering fallback (bulletproof)
+PYPP_OK = False
+try:
+    from pyppeteer import launch
+    PYPP_OK = True
+except Exception:
+    PYPP_OK = False
+
 # Optional OpenAI embeddings
 OPENAI_OK = False
 _openai_client = None
+EMBED_MODEL = "text-embedding-3-small"
+
 try:
-    # Prefer new SDK style
     from openai import OpenAI
     if st.secrets.get("OPENAI_API_KEY"):
         _openai_client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
         OPENAI_OK = True
-    else:
-        # env fallback
-        if os.getenv("OPENAI_API_KEY"):
-            _openai_client = OpenAI()
-            OPENAI_OK = True
+    elif os.getenv("OPENAI_API_KEY"):
+        _openai_client = OpenAI()
+        OPENAI_OK = True
 except Exception:
     try:
-        # Legacy fallback
         import openai as _openai_legacy
         if st.secrets.get("OPENAI_API_KEY"):
             _openai_legacy.api_key = st.secrets["OPENAI_API_KEY"]
@@ -87,7 +97,6 @@ AUTHOR_META_KEYS = [
     ("div", {"class": re.compile(r"author", re.I)}),
 ]
 
-# Expanded nav-like detector
 NAV_LIKE = re.compile(
     r"(nav|menu|breadcrumb|footer|toc|table-of-contents|sidebar|aside|"
     r"pagination|pager|next-prev|share|social|subscribe|cookie|banner|"
@@ -108,8 +117,6 @@ a an and the for with that this from your you are was were have has not but can 
 more most make made being been them they their there here very just about when where which also than then onto those these such
 to of in on by as at be it is or if so do did done we i me my us our yours theirs its it's
 """.split())
-
-EMBED_MODEL = "text-embedding-3-small"  # low-cost, solid for keyword relevance
 
 # -----------------------------
 # Helpers
@@ -202,14 +209,14 @@ def keyword_stuffing_risk(text: str) -> float:
     if ratio >= 0.10: return 1.0
     return (ratio - 0.03) / (0.10 - 0.03)
 
-def render_with_js(url: str, timeout=ABS_TIMEOUT, scrolldown=6) -> str:
+# -------- CSR Rendering: requests-html (fast path) --------
+def render_with_requests_html(url: str, timeout=ABS_TIMEOUT, scrolldown=6) -> str:
     if not HAS_REQ_HTML:
         raise RuntimeError("requests-html not installed")
     s = HTMLSession()
     r = s.get(url, headers=HEADERS, timeout=timeout)
-    # Give the app time to hydrate + scroll to trigger lazy loads
     r.html.render(
-        timeout=timeout * 1000,  # ms
+        timeout=timeout * 1000,
         sleep=1.5,
         scrolldown=scrolldown,
         reload=False,
@@ -217,13 +224,64 @@ def render_with_js(url: str, timeout=ABS_TIMEOUT, scrolldown=6) -> str:
     )
     return r.html.html
 
+# -------- CSR Rendering: Pyppeteer (deep fallback) --------
+async def _pyppeteer_render(url: str, timeout=40, scroll_steps=8, wait_selectors=None) -> str:
+    if wait_selectors is None:
+        wait_selectors = [
+            ".aem-Grid", ".article", "article", "main",
+            "[data-cmp-hook-richtext='text']", ".content", ".post-content", ".entry-content"
+        ]
+    browser = await launch(
+        headless=True,
+        args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu","--single-process"]
+    )
+    try:
+        page = await browser.newPage()
+        await page.setUserAgent(HEADERS["User-Agent"])
+        await page.setViewport({"width": 1366, "height": 900, "deviceScaleFactor": 1})
+        await page.goto(url, {"waitUntil": "networkidle2", "timeout": timeout*1000})
+
+        # Gentle scroll to trigger lazy loads
+        for _ in range(scroll_steps):
+            await page.evaluate("window.scrollBy(0, document.body.scrollHeight / 6);")
+            await page.waitForTimeout(600)
+
+        # Wait for any known content selector
+        found = False
+        for sel in wait_selectors:
+            try:
+                await page.waitForSelector(sel, {"timeout": 4000, "visible": True})
+                found = True
+                break
+            except Exception:
+                continue
+
+        # One extra idle wait to let late hydration finish
+        await page.waitForTimeout(800)
+
+        content = await page.content()
+        return content
+    finally:
+        try:
+            await browser.close()
+        except Exception:
+            pass
+
+def render_with_pyppeteer(url: str, timeout=40) -> str:
+    if not PYPP_OK:
+        raise RuntimeError("pyppeteer not installed")
+    import asyncio
+    return asyncio.get_event_loop().run_until_complete(_pyppeteer_render(url, timeout=timeout))
+
 def fetch_html(url: str, use_js: bool):
     """
-    Returns (html_text, fetch_ms, html_bytes, did_js)
-    Auto-upgrades to JS render if the first pass looks like CSR shell (tiny body / no content).
+    Returns (html_text, fetch_ms, html_bytes, did_js, renderer)
+    Auto-upgrades to JS render if first pass looks like CSR shell (tiny body / no content).
+    Tries requests-html first; if still looks empty and pyppeteer is available, uses pyppeteer.
     """
     import time as _t
     did_js = False
+    renderer = "plain"
 
     def _measure(text, t0):
         ms = int((_t.time() - t0) * 1000)
@@ -236,30 +294,49 @@ def fetch_html(url: str, use_js: bool):
     r.raise_for_status()
     html_text = r.text
     fetch_ms, html_bytes = _measure(html_text, t0)
-
-    # Quick CSR heuristic: tiny HTML or body with very few words
     soup_probe = BeautifulSoup(html_text, "html.parser")
     body_text = (soup_probe.body.get_text(" ", strip=True) if soup_probe.body else "")
     wordish = len(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]{3,}", body_text))
     looks_csr_shell = (html_bytes < 60_000) or (wordish < 120)
 
+    def _looks_empty(htm):
+        sp = BeautifulSoup(htm or "", "html.parser")
+        bt = (sp.body.get_text(" ", strip=True) if sp.body else "")
+        wd = len(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]{3,}", bt))
+        return wd < 120
+
+    # Pass 2: requests-html render
     if use_js or looks_csr_shell:
         try:
             did_js = True
+            renderer = "requests-html"
             t1 = _t.time()
-            html_text = render_with_js(url, timeout=max(ABS_TIMEOUT, 35), scrolldown=6)
+            html_text = render_with_requests_html(url, timeout=max(ABS_TIMEOUT, 35), scrolldown=8)
             fetch_ms, html_bytes = _measure(html_text, t1)
         except Exception:
-            # keep plain HTML fallback
             did_js = False
+            renderer = "plain"
 
-    return html_text, fetch_ms, html_bytes, did_js
+    # Pass 3: pyppeteer fallback if still empty
+    if (not html_text) or _looks_empty(html_text):
+        if PYPP_OK:
+            try:
+                did_js = True
+                renderer = "pyppeteer"
+                t2 = _t.time()
+                html_text = render_with_pyppeteer(url, timeout=45)
+                fetch_ms, html_bytes = _measure(html_text, t2)
+            except Exception:
+                # keep whatever we have
+                pass
+
+    return html_text, fetch_ms, html_bytes, did_js, renderer
 
 def extract_ldjson(soup: BeautifulSoup):
     blobs = []
     for tag in soup.find_all("script", type="application/ld+json"):
         text = (tag.string or tag.get_text() or "").strip()
-        if not text: 
+        if not text:
             continue
         try:
             blobs.append(json.loads(text))
@@ -273,7 +350,6 @@ def extract_ldjson(soup: BeautifulSoup):
     return blobs
 
 def extract_main_content(soup: BeautifulSoup):
-    # Prefer <article>, then <main>, fallback to body stripped
     candidates = soup.find_all(["article", "main"])
     if candidates:
         best = max(candidates, key=lambda c: len(c.get_text(" ", strip=True)))
@@ -289,13 +365,6 @@ def extract_main_content(soup: BeautifulSoup):
     return body
 
 def is_in_navigation_context(tag) -> bool:
-    """
-    Skip links inside true navigation/utility regions.
-    - Treat <nav>, <footer>, <aside> as navigation.
-    - Treat <header> as navigation ONLY if it's a direct child of <body>.
-    - Also skip ancestors whose class/id matches NAV_LIKE.
-    - If we hit <article> or role='main', assume content and stop checking.
-    """
     for parent in tag.parents:
         name = getattr(parent, "name", None)
         if not name:
@@ -315,7 +384,6 @@ def is_in_navigation_context(tag) -> bool:
     return False
 
 def visible_anchor_text(a):
-    """Prefer visible text; fallback to title/aria-label or <img alt>."""
     txt = clean_text(a.get_text(" ", strip=True))
     if txt:
         return txt
@@ -337,18 +405,8 @@ def extract_text_blocks(node):
 
 # ------------- PageSpeed Insights (CWV) -------------
 def fetch_pagespeed(url: str, api_key: str | None):
-    """
-    Returns dict with:
-      - perf_score (0..1), lab metrics (FCP, LCP, CLS, SI, TTI, TBT)
-      - field metrics (LCP_p75, CLS_p75, INP_p75) when available
-    Strategy: mobile
-    """
     base = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
-    params = {
-        "url": url,
-        "strategy": "mobile",
-        "category": "PERFORMANCE",
-    }
+    params = {"url": url, "strategy": "mobile", "category": "PERFORMANCE"}
     if api_key:
         params["key"] = api_key.strip()
     try:
@@ -362,7 +420,7 @@ def fetch_pagespeed(url: str, api_key: str | None):
     try:
         lh = data.get("lighthouseResult", {})
         cats = lh.get("categories", {})
-        out["perf_score"] = cats.get("performance", {}).get("score", None)  # 0..1
+        out["perf_score"] = cats.get("performance", {}).get("score", None)
         audits = lh.get("audits", {})
         def val(id_):
             v = audits.get(id_, {}).get("numericValue")
@@ -378,7 +436,6 @@ def fetch_pagespeed(url: str, api_key: str | None):
     except Exception:
         pass
 
-    # Field (CrUX) metrics
     try:
         le = data.get("loadingExperience", {})
         metrics = le.get("metrics", {})
@@ -388,7 +445,7 @@ def fetch_pagespeed(url: str, api_key: str | None):
             return float(p) if p is not None else None
         out["field"] = {
             "LCP_ms_p75": p75("LARGEST_CONTENTFUL_PAINT_MS"),
-            "CLS_p75": (metrics.get("CUMULATIVE_LAYOUT_SHIFT_SCORE", {}).get("percentile", None)),
+            "CLS_p75": metrics.get("CUMULATIVE_LAYOUT_SHIFT_SCORE", {}).get("percentile", None),
             "INP_ms_p75": p75("INTERACTION_TO_NEXT_PAINT"),
         }
     except Exception:
@@ -396,7 +453,6 @@ def fetch_pagespeed(url: str, api_key: str | None):
     return out
 
 def normalize_ms(value, good, poor):
-    """Map a metric (ms) to 0..1 where >=poor -> 0, <=good -> 1."""
     if value is None:
         return None
     if value <= good:
@@ -421,11 +477,9 @@ def embed_texts(texts: list[str]) -> list[list[float]] | None:
     if not OPENAI_OK or _openai_client is None or not texts:
         return None
     try:
-        # New SDK
         if "OpenAI" in str(type(_openai_client)):
             resp = _openai_client.embeddings.create(model=EMBED_MODEL, input=texts)
             return [d.embedding for d in resp.data]
-        # Legacy SDK
         else:
             resp = _openai_client.Embedding.create(model=EMBED_MODEL, input=texts)
             return [d["embedding"] for d in resp["data"]]
@@ -433,34 +487,23 @@ def embed_texts(texts: list[str]) -> list[list[float]] | None:
         return None
 
 def compute_keyword_relevance(full_text: str, h1: str, h2s: list[str], keywords_raw: str):
-    """
-    Returns (df, aggregate_score) where df columns:
-    Keyword | Matches | Density | LexicalScore (0..1) | SemanticSim (0..1 or None) | Relevance (0..1) | Recommendation
-    """
-    # Normalize keyword list
     raw = keywords_raw or ""
     if not raw.strip():
         return pd.DataFrame(columns=["Keyword","Matches","Density","LexicalScore","SemanticSim","Relevance","Recommendation"]), None
-    # Accept comma-separated or newline
     parts = [p.strip() for p in re.split(r"[\n,]+", raw) if p.strip()]
-    # De-dup while preserving order
     seen=set(); keywords=[]
     for p in parts:
         if p.lower() not in seen:
             keywords.append(p)
             seen.add(p.lower())
 
-    # Text prep
     text = (h1 or "") + " " + " ".join(h2s or []) + " " + (full_text or "")
     text_low = text.lower()
     total_words = max(1, len(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", text_low)))
 
     rows = []
-    # Semantic: build embeddings (page + keywords)
     semantic_sims = {}
-    page_for_embed = text
-    if len(page_for_embed) > 8000:  # cap chars to keep costs predictable
-        page_for_embed = page_for_embed[:8000]
+    page_for_embed = text[:8000] if len(text) > 8000 else text
     page_vec = None
     if OPENAI_OK:
         vecs = embed_texts([page_for_embed] + keywords)
@@ -471,29 +514,16 @@ def compute_keyword_relevance(full_text: str, h1: str, h2s: list[str], keywords_
 
     for kw in keywords:
         kw_low = kw.lower()
-        # match count (simple contains over word-ish tokens)
         matches = len(re.findall(r"\b" + re.escape(kw_low) + r"\b", text_low))
         density = matches / total_words
-        # lexical score: presence + mild density bonus (cap)
         lexical = 0.0
         if matches > 0:
             lexical = min(1.0, 0.6 + min(0.4, math.log1p(matches)/3.0))
-
         sem = semantic_sims.get(kw) if semantic_sims else None
-        if sem is None:
-            rel = lexical  # fallback: lexical only
-        else:
-            # Blend: 50% semantic, 50% lexical
-            rel = 0.5*min(1.0, max(0.0, sem)) + 0.5*lexical
-
-        # Quick rec
-        if rel >= 0.8:
-            rec = "Strong coverage."
-        elif rel >= 0.5:
-            rec = "Add specific examples, entities, and subheadings to deepen coverage."
-        else:
-            rec = "Create a focused section for this keyword with internal links and supporting media."
-
+        rel = (0.5*min(1.0, max(0.0, sem)) + 0.5*lexical) if sem is not None else lexical
+        if rel >= 0.8: rec = "Strong coverage."
+        elif rel >= 0.5: rec = "Deepen coverage with examples, entities, and subheadings."
+        else: rec = "Add a focused section + internal links + supporting media."
         rows.append([kw, matches, round(density,6), round(lexical,2), (round(sem,3) if sem is not None else None), round(rel,2), rec])
 
     df = pd.DataFrame(rows, columns=["Keyword","Matches","Density","LexicalScore","SemanticSim","Relevance","Recommendation"])
@@ -504,7 +534,7 @@ def compute_keyword_relevance(full_text: str, h1: str, h2s: list[str], keywords_
 # Extraction & Analysis
 # -----------------------------
 def analyze_url(url: str, use_js=False, exclude_toc=True, require_nonempty_anchor=False, want_psi=False, psi_key=None, keywords_raw:str=""):
-    html_text, fetch_ms, html_bytes, did_js = fetch_html(url, use_js)
+    html_text, fetch_ms, html_bytes, did_js, renderer = fetch_html(url, use_js)
     soup = BeautifulSoup(html_text, "html.parser")
 
     # If content still looks empty, try <noscript> fallback
@@ -696,7 +726,7 @@ def analyze_url(url: str, use_js=False, exclude_toc=True, require_nonempty_ancho
     url_has_year = bool(re.search(YEAR_IN_URL, url))
     url_has_date = bool(re.search(DATE_IN_URL, url))
 
-    # ----- Heuristic originality / AI-ish proxies (free) -----
+    # ----- Heuristic originality / AI-ish proxies -----
     tokens = [t.lower() for t in re.findall(r"[a-zA-ZÀ-ÖØ-öø-ÿ]{3,}", full_text)]
     total = len(tokens)
     cnt = Counter(tokens)
@@ -751,26 +781,21 @@ def analyze_url(url: str, use_js=False, exclude_toc=True, require_nonempty_ancho
     months_mod = months_since(modified_dt)
 
     # ----- PageSpeed / CWV -----
-    # "PSI optional (off by default) should always try the API first":
-    # If user enabled the switch OR if PAGESPEED_API_KEY exists in secrets, we attempt PSI; else heuristic.
     secrets_key = st.secrets.get("PAGESPEED_API_KEY")
     attempt_psi = bool(secrets_key) or want_psi
     psi = fetch_pagespeed(url, secrets_key or (psi_key if attempt_psi else None)) if attempt_psi else {"ok": False}
 
-    # Lab defaults
     lab_perf = psi.get("perf_score", None) if psi.get("ok") else None
     lab_LCP = psi.get("lab",{}).get("LCP_ms") if psi.get("ok") else None
     lab_CLS = psi.get("lab",{}).get("CLS") if psi.get("ok") else None
-    # Field p75 (preferred when present)
     field_LCP = psi.get("field",{}).get("LCP_ms_p75") if psi.get("ok") else None
     field_CLS = psi.get("field",{}).get("CLS_p75") if psi.get("ok") else None
     field_INP = psi.get("field",{}).get("INP_ms_p75") if psi.get("ok") else None
 
-    # Fallback heuristic score if PSI missing: HTML size + images+videos + scripts + fetch time
     heuristic_perf = None
     if not psi.get("ok"):
         size_score = 1.0 if html_bytes <= 200_000 else 0.7 if html_bytes <= 500_000 else 0.4 if html_bytes <= 1_000_000 else 0.2
-        media_pen = min(1.0, (img_count + video_like*3) / 20)  # more media → slower
+        media_pen = min(1.0, (img_count + video_like*3) / 20)
         media_score = 1.0 - 0.6*media_pen
         scripts_pen = min(1.0, (len(third_party_scripts)/10) + (inline_scripts/40))
         scripts_score = 1.0 - 0.7*scripts_pen
@@ -782,7 +807,7 @@ def analyze_url(url: str, use_js=False, exclude_toc=True, require_nonempty_ancho
         "perf_score": lab_perf if lab_perf is not None else heuristic_perf,
         "LCP_ms": field_LCP if field_LCP is not None else lab_LCP,
         "CLS": field_CLS if field_CLS is not None else lab_CLS,
-        "INP_ms": field_INP,  # may be None
+        "INP_ms": field_INP,
         "FCP_ms": psi.get("lab",{}).get("FCP_ms") if psi.get("ok") else None,
         "TTI_ms": psi.get("lab",{}).get("TTI_ms") if psi.get("ok") else None,
         "TBT_ms": psi.get("lab",{}).get("TBT_ms") if psi.get("ok") else None,
@@ -792,12 +817,12 @@ def analyze_url(url: str, use_js=False, exclude_toc=True, require_nonempty_ancho
         "third_party_scripts": len(third_party_scripts),
         "inline_scripts": inline_scripts,
         "did_js": did_js,
+        "renderer": renderer,
     }
 
-    # ----- Keyword Relevance (OpenAI + lexical) -----
+    # ----- Keyword Relevance -----
     kw_df, kw_agg = compute_keyword_relevance(full_text, h1, h2s, keywords_raw)
 
-    # Summarize
     return {
         "title": title, "meta_desc": meta_desc, "h1": h1, "h2s": h2s,
         "word_count": word_count, "reading_ease": reading_ease,
@@ -823,68 +848,67 @@ def analyze_url(url: str, use_js=False, exclude_toc=True, require_nonempty_ancho
     }
 
 # -----------------------------
-# Scoring Model (0..100)
+# Scoring Model (0..100) + category breakdown
 # -----------------------------
 def score_page(s: dict):
     weights = {
-        # On-page (incl. lead score) — 35
+        # On-page (incl. lead score) — 25
         "title_match": 6,
         "h_structure": 5,
         "content_depth": 8,
         "readability": 4,
-        "url_evergreen": 3,
-        "lead_priority": 9,
+        "url_evergreen": 2,  # 6+5+8+4+2 = 25
+        "lead_priority": 0,  # moved lead to on-page depth proxy above earlier, keep at 0 or fold into content_depth logic
 
-        # Links in content — 20
-        "internal_links": 5,
-        "external_links": 4,
-        "image_alts": 4,
-        "internal_anchor_quality": 3,
-        "internal_semantic": 4,
+        # Links in content — folded into On-page above (kept in breakdown table but weight 0 here)
+        "internal_links": 0,
+        "external_links": 0,
+        "image_alts": 0,
+        "internal_anchor_quality": 0,
+        "internal_semantic": 0,
 
-        # E-E-A-T proxies — 20
-        "author": 5,
-        "org_schema": 3,
-        "person_schema": 2,
-        "jsonld": 3,
-        "about_contact": 2,
-        "citations": 5,
+        # E-E-A-T proxies — 25
+        "author": 6,
+        "org_schema": 4,
+        "person_schema": 3,
+        "jsonld": 4,
+        "about_contact": 4,
+        "citations": 4,  # 6+4+3+4+4+4 = 25
 
-        # Freshness / canonical — 12
-        "fresh_pub": 4,
-        "fresh_mod": 4,
-        "canonical_ok": 4,
+        # UX / Speed — 20
+        "ux_perf": 9,
+        "ux_lcp": 4,
+        "ux_cls": 3,
+        "ux_inp": 4,  # 9+4+3+4 = 20
 
-        # Quality & safety — 13
-        "viewport": 3,
-        "noindex": 3,
-        "stuffing_penalty": 3,
-        "originality": 2,
-        "content_effort": 2,
+        # Originality / Effort — 20
+        "no_stuffing": 5,
+        "originality": 7,
+        "content_effort": 8,  # 5+7+8 = 20
 
-        # UX & Speed — 15
-        "ux_perf": 7,
-        "ux_lcp": 3,
-        "ux_cls": 2,
-        "ux_inp": 3,
+        # Freshness / Canonical — fold into On-page (weight 0 here but show in table)
+        "fresh_pub": 0,
+        "fresh_mod": 0,
+        "canonical_ok": 0,
+        "viewport": 0,
+        "noindex": 0,
 
-        # NEW: Keyword Relevance — 10
+        # Keyword Relevance — 10
         "kw_relevance": 10,
     }
-    max_points = sum(weights.values())
-    pts = 0.0
-    recs = []
 
-    title = s.get("title",""); h1 = s.get("h1","")
+    # Compute individual signals (as before)
+    recs = []
+    pts = 0.0
+
+    # --- On-page signals ---
+    title = s.get("title",""); h1 = s.get("h1",""); h2s = s.get("h2s") or []
     title_ok = 0.0
     if 25 <= len(title) <= 70: title_ok += 0.6
     if h1 and title and (h1.lower() in title.lower() or title.lower() in h1.lower()): title_ok += 0.4
-    pts += title_ok * weights["title_match"]
     if title_ok < 1.0: recs.append("Tighten <title> to 25–70 chars and align strongly with H1 / search intent.")
 
-    h2s = s.get("h2s") or []
     h_ok = 1.0 if (h1 and len(h2s) >= 2) else 0.5 if (h1 or len(h2s)>=1) else 0.0
-    pts += h_ok * weights["h_structure"]
     if h_ok < 1.0: recs.append("Use a clear heading hierarchy: one H1 and 2–6 H2s covering subtopics.")
 
     wc = s.get("word_count",0)
@@ -896,7 +920,6 @@ def score_page(s: dict):
         depth = 1.0
     else:
         depth = 0.9
-    pts += depth * weights["content_depth"]
 
     fre = s.get("reading_ease",0)
     if fre < 30:
@@ -905,129 +928,58 @@ def score_page(s: dict):
     elif fre <= 80: rscore=1.0
     elif fre <= 90: rscore=0.8
     else: rscore=0.6
-    pts += rscore * weights["readability"]
 
     evergreen = 0.2 if (s.get("url_has_year") or s.get("url_has_date")) else 1.0
     if evergreen < 1.0: recs.append("Prefer evergreen URLs (avoid embedding years/dates in path).")
-    pts += evergreen * weights["url_evergreen"]
 
-    # Lead priority
-    lead = s.get("lead_score",0.0)
-    pts += lead * weights["lead_priority"]
-    if lead < 0.6: recs.append("Open with the most important info in the first ~150 words (entities, numbers, answers).")
-
-    # Links/media (content-only)
+    # Links/media (kept for recommendations)
     intern = len(s.get("p_internal_links",[]))
     extern = len(s.get("p_external_links",[]))
     if intern == 0:
-        il=0.0; recs.append("Add contextual internal links inside content (aim 3–15).")
+        recs.append("Add contextual internal links inside content (aim 3–15).")
     elif intern < 3:
-        il=0.6; recs.append("Add a few more internal links in the main content.")
-    elif intern <= 20:
-        il=1.0
-    else: il=0.9
-    pts += il * weights["internal_links"]
+        recs.append("Add a few more internal links in the main content.")
+    elif intern > 20:
+        recs.append("Trim excessive internal links to avoid dilution.")
 
     if extern == 0:
-        el=0.0; recs.append("Cite reputable external sources (1–10) inside the content.")
-    elif extern <= 10:
-        el=1.0
-    else: el=0.8
-    pts += el * weights["external_links"]
+        recs.append("Cite reputable external sources (1–10) inside the content.")
+    elif extern > 10:
+        recs.append("Trim excessive external links; focus on the strongest citations.")
 
     alt_pct = s.get("img_alt_pct",0.0)
-    ia = 1.0 if alt_pct>=0.9 else 0.8 if alt_pct>=0.6 else 0.5 if alt_pct>0 else 0.0
     if alt_pct < 0.6: recs.append("Improve image alt coverage (aim >60%).")
-    pts += ia * weights["image_alts"]
 
     iaq = s.get("internal_anchor_quality",0.0)
-    pts += iaq * weights["internal_anchor_quality"]
     if iaq < 0.7: recs.append("Use descriptive internal anchor text (avoid ‘click here’; use 3+ meaningful words).")
 
     isem = s.get("internal_semantic_score",0.0)
-    pts += isem * weights["internal_semantic"]
     if isem < 0.6: recs.append("Link to semantically related internal URLs (align slugs with key entities/topics).")
 
-    # E-E-A-T proxies
+    # --- E-E-A-T ---
     ap = 1.0 if s.get("author_present") else 0.0
     if ap==0.0: recs.append("Add clear author attribution with credentials and an author page.")
-    pts += ap * weights["author"]
-
     org = 1.0 if s.get("org_schema") else 0.0
-    per = 1.0 if s.get("person_schema") else 0.0
-    jsonld = 1.0 if s.get("jsonld_present") else 0.0
     if org==0.0: recs.append("Add Organization schema (name, logo, sameAs).")
+    per = 1.0 if s.get("person_schema") else 0.0
     if per==0.0: recs.append("Add Person schema for the author.")
+    jsonld = 1.0 if s.get("jsonld_present") else 0.0
     if jsonld==0.0: recs.append("Add Article/BlogPosting JSON-LD with author & dates.")
-    pts += org * weights["org_schema"]
-    pts += per * weights["person_schema"]
-    pts += jsonld * weights["jsonld"]
-
     about_contact = any(any(x in u.lower() for x in ["/about","/contact","/impressum","/company"]) for u in s.get("p_internal_links",[]))
     ac = 1.0 if about_contact else 0.0
     if ac==0.0: recs.append("Link prominently to About/Contact to improve trust.")
-    pts += ac * weights["about_contact"]
-
     citations = 1.0 if extern>0 else 0.0
-    pts += citations * weights["citations"]
 
-    # Freshness & canonical
-    mp = s.get("months_since_pub", math.inf)
-    if mp <= 6: fp=1.0
-    elif mp <= 18: fp=0.8
-    elif mp <= 24: fp=0.6
-    else:
-        fp=0.2; recs.append("Refresh old content or add a clear ‘last updated’ if materially revised.")
-    pts += fp * weights["fresh_pub"]
-
-    mm = s.get("months_since_mod", math.inf)
-    if mm <= 3: fm=1.0
-    elif mm <= 12: fm=0.8
-    elif math.isfinite(mm): fm=0.4
-    else:
-        fm=0.2; recs.append("Make a meaningful update and surface the modified date.")
-    pts += fm * weights["fresh_mod"]
-
-    canonical_ok = 1.0 if (s.get("canonical") and not s.get("canonical_offsite")) else 0.6 if s.get("canonical") else 0.8
-    if not s.get("canonical"): recs.append("Declare a canonical URL.")
-    if s.get("canonical_offsite"): recs.append("Canonical points off-site — verify this is intended.")
-    pts += canonical_ok * weights["canonical_ok"]
-
-    # Quality/safety
-    viewport = 1.0 if s.get("viewport_ok") else 0.6
-    if viewport<1.0: recs.append("Add responsive meta viewport.")
-    pts += viewport * weights["viewport"]
-
-    noindex = 1.0 if not s.get("robots_noindex") else 0.0
-    if noindex==0.0: recs.append("Remove noindex if you want this page to rank.")
-    pts += noindex * weights["noindex"]
-
-    stuffing = 1.0 - min(1.0, s.get("stuffing_risk",0.0))
-    if s.get("stuffing_risk",0.0) >= 0.5: recs.append("Reduce repeated keyword usage; vary phrasing and add unique value.")
-    pts += stuffing * weights["stuffing_penalty"]
-
-    orig = s.get("originality_score",0.0)
-    pts += orig * weights["originality"]
-    if orig < 0.6: recs.append("Increase originality: add unique data, examples, quotes; avoid stock phrasing.")
-
-    effort = s.get("content_effort_score",0.0)
-    pts += effort * weights["content_effort"]
-    if effort < 0.6: recs.append("Add images (with alts), embed video, include schema & clear authorship.")
-
-    # --- UX & Speed ---
+    # --- UX / Speed ---
     ux = s.get("ux", {})
-    perf = ux.get("perf_score")  # 0..1 (PSI) or heuristic 0..1
+    perf = ux.get("perf_score")
     if perf is None:
         perf = 0.5
-        recs.append("Could not fetch PageSpeed; consider enabling PSI with an API key for CWV-backed scoring.")
-    pts += perf * weights["ux_perf"]
-
+        recs.append("Could not fetch PageSpeed; enable PSI with an API key for CWV-backed scoring.")
     lcp = ux.get("LCP_ms")
     lcp_score = normalize_ms(lcp, 2500, 4000) if lcp is not None else 0.6
     if lcp is not None and lcp_score < 0.8:
-        recs.append("Improve LCP: optimize hero image, reduce render-blocking JS/CSS, use critical CSS and lazy-load below-the-fold.")
-    pts += lcp_score * weights["ux_lcp"]
-
+        recs.append("Improve LCP: optimize hero image, reduce render-blocking JS/CSS, inline critical CSS, lazy-load below-the-fold.")
     cls = ux.get("CLS")
     if cls is None:
         cls_score = 0.6
@@ -1036,66 +988,106 @@ def score_page(s: dict):
         elif cls >= 0.25: cls_score = 0.0
         else: cls_score = (0.25 - cls) / (0.25 - 0.1)
         if cls_score < 0.8:
-            recs.append("Reduce CLS: set image/video dimensions, reserve space for embeds/ads, avoid injecting DOM above content.")
-    pts += cls_score * weights["ux_cls"]
-
+            recs.append("Reduce CLS: reserve space for media/embeds, set width/height, avoid DOM injection above content.")
     inp = ux.get("INP_ms")
     inp_score = normalize_ms(inp, 200, 500) if inp is not None else 0.6
     if inp is not None and inp_score < 0.8:
-        recs.append("Improve responsiveness (INP): minimize long tasks, split bundles, hydrate interactives lazily.")
-    pts += inp_score * weights["ux_inp"]
+        recs.append("Improve responsiveness (INP): split long tasks, code-split bundles, hydrate interactives lazily.")
 
-    # --- Keyword Relevance (avg across entered keywords) ---
+    # --- Originality / Effort ---
+    stuffing = 1.0 - min(1.0, s.get("stuffing_risk",0.0))
+    if s.get("stuffing_risk",0.0) >= 0.5: recs.append("Reduce repeated keyword usage; vary phrasing and add unique value.")
+    orig = s.get("originality_score",0.0)
+    if orig < 0.6: recs.append("Increase originality: add unique data, examples, quotes; avoid stock phrasing.")
+    effort = s.get("content_effort_score",0.0)
+    if effort < 0.6: recs.append("Add images (with alts), embed video, include schema & clear authorship.")
+
+    # --- Freshness / Canonical (recommendations only here) ---
+    mp = s.get("months_since_pub", math.inf)
+    if mp > 24: recs.append("Refresh old content or add a clear ‘last updated’ if materially revised.")
+    mm = s.get("months_since_mod", math.inf)
+    if not math.isinf(mm) and mm > 12: recs.append("Make a meaningful update and surface the modified date.")
+    if not s.get("canonical"): recs.append("Declare a canonical URL.")
+    if s.get("canonical_offsite"): recs.append("Canonical points off-site — verify this is intended.")
+    if not s.get("viewport_ok"): recs.append("Add responsive meta viewport.")
+    if s.get("robots_noindex"): recs.append("Remove noindex if you want this page to rank.")
+
+    # --- Keyword Relevance ---
     kw_agg = s.get("kw_agg")
-    if kw_agg is None:
-        kw_points = 0.0
-    else:
-        kw_points = max(0.0, min(1.0, float(kw_agg)))
-        if kw_points < 0.7:
-            recs.append("Strengthen topical relevance: add sections that explicitly target your priority keywords and entities.")
-    pts += kw_points * weights["kw_relevance"]
+    kw_points = max(0.0, min(1.0, float(kw_agg))) if kw_agg is not None else 0.0
+    if kw_points < 0.7:
+        recs.append("Strengthen topical relevance: add sections that explicitly target your priority keywords and entities.")
 
-    score_100 = round(pts / max_points * 100, 1)
+    # ----- Award points by category -----
+    # On-page (25)
+    onpage_points = (
+        title_ok*6 + h_ok*5 + depth*8 + rscore*4 + evergreen*2
+    )
 
-    breakdown = pd.DataFrame([
-        ("Title / Intent", round(title_ok*weights["title_match"],2), weights["title_match"]),
-        ("Heading Structure", round(h_ok*weights["h_structure"],2), weights["h_structure"]),
-        ("Content Depth", round(depth*weights["content_depth"],2), weights["content_depth"]),
-        ("Readability", round(rscore*weights["readability"],2), weights["readability"]),
-        ("Evergreen URL", round(evergreen*weights["url_evergreen"],2), weights["url_evergreen"]),
-        ("Lead Priority", round(lead*weights["lead_priority"],2), weights["lead_priority"]),
-        ("Internal Links (content)", round(il*weights["internal_links"],2), weights["internal_links"]),
-        ("External Citations (content)", round(el*weights["external_links"],2), weights["external_links"]),
-        ("Image Alt Coverage", round(ia*weights["image_alts"],2), weights["image_alts"]),
-        ("Internal Anchor Quality", round(iaq*weights["internal_anchor_quality"],2), weights["internal_anchor_quality"]),
-        ("Internal Semantic Relatedness", round(isem*weights["internal_semantic"],2), weights["internal_semantic"]),
-        ("Author Attribution", round(ap*weights["author"],2), weights["author"]),
-        ("Org Schema", round(org*weights["org_schema"],2), weights["org_schema"]),
-        ("Person Schema", round(per*weights["person_schema"],2), weights["person_schema"]),
-        ("JSON-LD Present", round(jsonld*weights["jsonld"],2), weights["jsonld"]),
-        ("About/Contact Links", round(ac*weights["about_contact"],2), weights["about_contact"]),
-        ("Citations Present", round(citations*weights["citations"],2), weights["citations"]),
-        ("Freshness (Publish)", round(fp*weights["fresh_pub"],2), weights["fresh_pub"]),
-        ("Freshness (Modify)", round(fm*weights["fresh_mod"],2), weights["fresh_mod"]),
-        ("Canonical OK", round(canonical_ok*weights["canonical_ok"],2), weights["canonical_ok"]),
-        ("Viewport / Mobile", round(viewport*weights["viewport"],2), weights["viewport"]),
-        ("Indexable", round(noindex*weights["noindex"],2), weights["noindex"]),
-        ("No Stuffing", round(stuffing*weights["stuffing_penalty"],2), weights["stuffing_penalty"]),
-        ("Originality", round(orig*weights["originality"],2), weights["originality"]),
-        ("Content Effort", round(effort*weights["content_effort"],2), weights["content_effort"]),
-        ("UX: Performance", round(perf*weights["ux_perf"],2), weights["ux_perf"]),
-        ("UX: LCP", round(lcp_score*weights["ux_lcp"],2), weights["ux_lcp"]),
-        ("UX: CLS", round(cls_score*weights["ux_cls"],2), weights["ux_cls"]),
-        ("UX: INP", round(inp_score*weights["ux_inp"],2), weights["ux_inp"]),
-        ("Keyword Relevance (avg)", round(kw_points*weights["kw_relevance"],2), weights["kw_relevance"]),
-    ], columns=["Signal","Points Awarded","Max Points"])
+    # E-E-A-T (25)
+    eeat_points = (
+        ap*6 + org*4 + per*3 + jsonld*4 + ac*4 + citations*4
+    )
 
-    # dedupe recs, cap at 16
+    # UX / Speed (20)
+    ux_points = (
+        (perf or 0.0)*9 + (lcp_score or 0.0)*4 + (cls_score or 0.0)*3 + (inp_score or 0.0)*4
+    )
+
+    # Originality / Effort (20)
+    oe_points = (
+        stuffing*5 + orig*7 + effort*8
+    )
+
+    # Keyword Relevance (10)
+    kw_cat_points = kw_points*10
+
+    total_points = onpage_points + eeat_points + ux_points + oe_points + kw_cat_points
+    score_100 = round(total_points, 1)  # already normalized to 100 via category caps
+
+    # Build category breakdown DF
+    cat_df = pd.DataFrame([
+        ["On-Page", round(onpage_points,2), 25],
+        ["E-E-A-T", round(eeat_points,2), 25],
+        ["UX / Speed", round(ux_points,2), 20],
+        ["Originality / Effort", round(oe_points,2), 20],
+        ["Keyword Relevance", round(kw_cat_points,2), 10],
+    ], columns=["Category","Points","Max"])
+
+    # Flat breakdown table for transparency (optional to display)
+    detail_rows = [
+        ("Title / Intent", round(title_ok*6,2), 6),
+        ("Heading Structure", round(h_ok*5,2), 5),
+        ("Content Depth", round(depth*8,2), 8),
+        ("Readability", round(rscore*4,2), 4),
+        ("Evergreen URL", round(evergreen*2,2), 2),
+
+        ("Author Attribution", round(ap*6,2), 6),
+        ("Org Schema", round(org*4,2), 4),
+        ("Person Schema", round(per*3,2), 3),
+        ("JSON-LD Present", round(jsonld*4,2), 4),
+        ("About/Contact Links", round(ac*4,2), 4),
+        ("Citations Present", round(citations*4,2), 4),
+
+        ("UX: Performance", round((perf or 0.0)*9,2), 9),
+        ("UX: LCP", round((lcp_score or 0.0)*4,2), 4),
+        ("UX: CLS", round((cls_score or 0.0)*3,2), 3),
+        ("UX: INP", round((inp_score or 0.0)*4,2), 4),
+
+        ("No Stuffing", round(stuffing*5,2), 5),
+        ("Originality", round(orig*7,2), 7),
+        ("Content Effort", round(effort*8,2), 8),
+
+        ("Keyword Relevance (avg)", round(kw_points*10,2), 10),
+    ]
+    breakdown = pd.DataFrame(detail_rows, columns=["Signal","Points Awarded","Max Points"])
+
+    # Dedup & cap recs
     seen=set(); uniq=[]
     for r in recs:
         if r not in seen:
             uniq.append(r); seen.add(r)
-    return score_100, breakdown, uniq[:16]
+    return score_100, cat_df, breakdown, uniq[:18]
 
 # -----------------------------
 # UI
@@ -1111,12 +1103,13 @@ with st.sidebar:
     keywords_input = st.text_area("Target Keywords (one per line or comma-separated)", height=120,
                                   placeholder="e.g.\niphone 15 battery life\na15 vs a16 speed\nbest iphone tips")
 
-    js = st.checkbox("Enable JavaScript rendering (experimental)", value=False,
-                     help="Auto-upgrades to JS render when page looks CSR-only. Uses Pyppeteer under the hood.")
+    js = st.checkbox("Enable JavaScript rendering (manual boost)", value=False,
+                     help="The app auto-detects CSR pages and renders JS anyway. Enable to force JS render early.")
     exclude_toc = st.checkbox("Exclude Table of Contents links", value=True,
                               help="Skips #fragment links and links inside toc/table-of-contents wrappers.")
     require_nonempty_anchor = st.checkbox("Require non-empty anchor text", value=False,
                               help="Ignore links with no visible/title/aria/img-alt text.")
+
     st.markdown("---")
     st.subheader("Core Web Vitals")
     want_psi_switch = st.checkbox("Fetch Google PageSpeed (mobile)", value=False,
@@ -1126,7 +1119,7 @@ with st.sidebar:
     ua = st.text_input("Custom User-Agent (optional)", value=HEADERS["User-Agent"])
     run = st.button("Run Analysis", type="primary")
     st.markdown("---")
-    st.caption("Counts in-content links across the page (div/section/li, etc.), excluding global nav/footer/aside & nav-like wrappers. Auto-renders JS for CSR shells.")
+    st.caption("In-content links across the page (div/section/li, etc.), excluding global nav/footer/aside & nav-like wrappers. Auto-renders JS for CSR shells.")
 
 if run:
     if not url:
@@ -1144,13 +1137,24 @@ if run:
                 psi_key=(psi_key_manual or None),
                 keywords_raw=keywords_input or ""
             )
-            score, breakdown, recs = score_page(signals)
+            score, cat_df, breakdown, recs = score_page(signals)
         except requests.exceptions.RequestException as e:
             st.error(f"Network error: {e}"); st.stop()
         except Exception as e:
             st.exception(e); st.stop()
 
+    # GREEN SCORE CARD
     st.success(f"SignalScore Content: **{score}/100**")
+
+    # CATEGORY BAR CHART (under card)
+    chart_df = cat_df.copy()
+    chart_df["Pct"] = (chart_df["Points"] / chart_df["Max"]) * 100
+    fig = px.bar(chart_df, x="Category", y="Pct", range_y=[0,100],
+                 text=chart_df["Pct"].round(1).astype(str) + "%",
+                 labels={"Pct":"% of Category Max"})
+    fig.update_traces(textposition="outside")
+    fig.update_layout(margin=dict(l=10,r=10,t=10,b=10), height=320)
+    st.plotly_chart(fig, use_container_width=True)
 
     # KPI Row
     c1,c2,c3,c4,c5 = st.columns(5)
@@ -1162,12 +1166,14 @@ if run:
         perf = signals["ux"].get("perf_score")
         st.metric("UX Perf (0–1)", f"{perf:.2f}" if perf is not None else "—")
 
-    tab1,tab2,tab3,tab4,tab5 = st.tabs(["Score Breakdown","Signals","Keyword Relevance","Recommendations","Debug"])
+    tab1,tab2,tab3,tab4,tab5,tab6 = st.tabs([
+        "Category Breakdown","Signals","Keyword Relevance","Recommendations","Detailed Breakdown","Debug"
+    ])
 
     with tab1:
-        st.subheader("Score Breakdown")
-        st.dataframe(breakdown, use_container_width=True, hide_index=True)
-        st.caption("Points Awarded vs Max Points (weights).")
+        st.subheader("Category Breakdown")
+        st.dataframe(cat_df, use_container_width=True, hide_index=True)
+        st.caption("Points vs Max per category. The overall score sums all category points (max 100).")
 
     with tab2:
         st.subheader("Extracted Signals")
@@ -1200,7 +1206,8 @@ if run:
                     "Robots Noindex","JSON-LD Present","Org Schema","Person Schema",
                     "URL Has Year","URL Has Date","Images (count)","Images w/ Alt %","Videos (embeds)",
                     "Perf Score (PSI/heuristic)","LCP (ms)","CLS","INP (ms)",
-                    "Fetch Time (ms)","HTML Size (bytes)","3P Scripts","Inline Scripts","JS Rendered?"
+                    "Fetch Time (ms)","HTML Size (bytes)","3P Scripts","Inline Scripts",
+                    "JS Rendered?","Renderer"
                 ],
                 "Value":[
                     signals["viewport_ok"], bool(signals["canonical"]), signals["canonical_offsite"],
@@ -1208,7 +1215,8 @@ if run:
                     signals["url_has_year"], signals["url_has_date"], signals["img_count"], f"{int(round(signals['img_alt_pct']*100))}%", signals["video_like"],
                     (f"{ux.get('perf_score'):.2f}" if ux.get("perf_score") is not None else "—"),
                     ux.get("LCP_ms"), ux.get("CLS"), ux.get("INP_ms"),
-                    ux.get("fetch_time_ms"), ux.get("html_bytes"), ux.get("third_party_scripts"), ux.get("inline_scripts"), ux.get("did_js")
+                    ux.get("fetch_time_ms"), ux.get("html_bytes"), ux.get("third_party_scripts"), ux.get("inline_scripts"),
+                    ux.get("did_js"), ux.get("renderer"),
                 ],
             }))
             if signals["ld_types"]:
@@ -1219,7 +1227,8 @@ if run:
         kw_df = signals.get("kw_df")
         if kw_df is not None and not kw_df.empty:
             st.dataframe(kw_df, use_container_width=True)
-            st.caption(f"Average Relevance: **{signals.get('kw_agg'):.2f}** (feeds the 10-point Keyword Relevance block).")
+            if signals.get('kw_agg') is not None:
+                st.caption(f"Average Relevance: **{signals.get('kw_agg'):.2f}** (feeds the 10-point Keyword Relevance block).")
         else:
             st.info("Enter target keywords in the sidebar to compute per-keyword relevance.")
 
@@ -1232,6 +1241,34 @@ if run:
         st.caption("CWV shown when available from PageSpeed Insights. Otherwise, heuristic UX score is used. Keyword relevance blends OpenAI semantic similarity (if API key present) with lexical coverage.")
 
     with tab5:
+        st.subheader("Detailed Breakdown (Why you scored this way)")
+        onpage = cat_df.loc[cat_df["Category"]=="On-Page","Points"].values[0]
+        eeat = cat_df.loc[cat_df["Category"]=="E-E-A-T","Points"].values[0]
+        uxsp = cat_df.loc[cat_df["Category"]=="UX / Speed","Points"].values[0]
+        oe = cat_df.loc[cat_df["Category"]=="Originality / Effort","Points"].values[0]
+        kwp = cat_df.loc[cat_df["Category"]=="Keyword Relevance","Points"].values[0]
+
+        st.markdown("### On-Page (max 25)")
+        st.markdown("- Title/H1 alignment, heading hierarchy, depth (~800–1800 words), readability (FRE), evergreen URL.")
+        st.markdown(f"**Awarded:** {onpage:.1f}/25")
+
+        st.markdown("### E-E-A-T (max 25)")
+        st.markdown("- Clear author attribution, Organization/Person schema, Article JSON-LD, About/Contact presence, reputable citations.")
+        st.markdown(f"**Awarded:** {eeat:.1f}/25")
+
+        st.markdown("### UX / Speed (max 20)")
+        st.markdown("- PageSpeed performance score (mobile), LCP, CLS, INP (field preferred; lab fallback); otherwise heuristic based on size/media/scripts/fetch time.")
+        st.markdown(f"**Awarded:** {uxsp:.1f}/20")
+
+        st.markdown("### Originality / Effort (max 20)")
+        st.markdown("- No keyword stuffing, vocabulary/structure diversity, images with alts, video embeds, author/schema presence.")
+        st.markdown(f"**Awarded:** {oe:.1f}/20")
+
+        st.markdown("### Keyword Relevance (max 10)")
+        st.markdown("- OpenAI embeddings (`text-embedding-3-small`) for semantic coverage + lexical matches/density.")
+        st.markdown(f"**Awarded:** {kwp:.1f}/10")
+
+    with tab6:
         st.subheader("Debug / Raw")
         st.json({
             "url": url,
@@ -1243,5 +1280,4 @@ if run:
             "kw_df_preview": signals.get("kw_df").head(10).to_dict(orient="records") if (signals.get("kw_df") is not None and not signals.get("kw_df").empty) else [],
         })
 else:
-    st.title("")
     st.info("Enter a URL + optional target keywords in the sidebar and click **Run Analysis**.")
