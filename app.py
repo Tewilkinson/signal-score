@@ -248,6 +248,13 @@ async def _pyppeteer_render(url: str, timeout=40, scroll_steps=8, wait_selectors
     try:
         page = await browser.newPage()
         await page.setUserAgent(HEADERS["User-Agent"])
+        # Enrich headers to avoid geo/cookie walls and bot flags
+        await page.setExtraHTTPHeaders({
+            "Accept": HEADERS.get("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+            "Accept-Language": "en-US,en;q=0.9",
+            "Upgrade-Insecure-Requests": "1",
+            "DNT": "1",
+        })
         await page.setViewport({"width": 1366, "height": 900, "deviceScaleFactor": 1})
         await page.goto(url, {"waitUntil": "networkidle2", "timeout": timeout*1000})
 
@@ -255,6 +262,27 @@ async def _pyppeteer_render(url: str, timeout=40, scroll_steps=8, wait_selectors
         for _ in range(scroll_steps):
             await page.evaluate("window.scrollBy(0, document.body.scrollHeight / 6);")
             await page.waitForTimeout(600)
+
+        # Try to accept cookie/consent dialogs commonly seen (e.g., Snowflake)
+        try:
+            # Click buttons with common accept text
+            accept_btns = [
+                "button:has-text('Accept All')",
+                "button:has-text('Accept all')",
+                "button:has-text('I Accept')",
+                "button:has-text('Agree')",
+                "#onetrust-accept-btn-handler",
+                "button#truste-consent-button",
+            ]
+            for sel in accept_btns:
+                try:
+                    await page.click(sel, {"delay": 50})
+                    await page.waitForTimeout(500)
+                    break
+                except Exception:
+                    continue
+        except Exception:
+            pass
 
         # Wait for any known content selector
         found = False
@@ -277,7 +305,7 @@ async def _pyppeteer_render(url: str, timeout=40, scroll_steps=8, wait_selectors
         except Exception:
             pass
 
-def render_with_pyppeteer(url: str, timeout=40) -> str:
+def render_with_pyppeteer(url: str, timeout=40, wait_selectors=None) -> str:
     if not PYPP_OK:
         raise RuntimeError("pyppeteer not installed")
     import asyncio
@@ -285,14 +313,14 @@ def render_with_pyppeteer(url: str, timeout=40) -> str:
         loop = asyncio.get_event_loop()
         if loop.is_running():
             # With nest_asyncio applied above, we can safely run until complete
-            return loop.run_until_complete(_pyppeteer_render(url, timeout=timeout))
+            return loop.run_until_complete(_pyppeteer_render(url, timeout=timeout, scroll_steps=10, wait_selectors=wait_selectors))
         else:
-            return loop.run_until_complete(_pyppeteer_render(url, timeout=timeout))
+            return loop.run_until_complete(_pyppeteer_render(url, timeout=timeout, scroll_steps=10, wait_selectors=wait_selectors))
     except RuntimeError:
         # No current event loop; use asyncio.run
-        return asyncio.run(_pyppeteer_render(url, timeout=timeout))
+        return asyncio.run(_pyppeteer_render(url, timeout=timeout, scroll_steps=10, wait_selectors=wait_selectors))
 
-def fetch_html(url: str, use_js: bool):
+def fetch_html(url: str, use_js: bool, wait_selectors: list[str] | None = None):
     """
     Returns (html_text, fetch_ms, html_bytes, did_js, renderer)
     Auto-upgrades to JS render if first pass looks like CSR shell (tiny body / no content).
@@ -344,7 +372,7 @@ def fetch_html(url: str, use_js: bool):
                 did_js = True
                 renderer = "pyppeteer"
                 t2 = _t.time()
-                html_text = render_with_pyppeteer(url, timeout=45)
+                html_text = render_with_pyppeteer(url, timeout=55, wait_selectors=wait_selectors)
                 fetch_ms, html_bytes = _measure(html_text, t2)
             except Exception:
                 # keep whatever we have
@@ -553,8 +581,21 @@ def compute_keyword_relevance(full_text: str, h1: str, h2s: list[str], keywords_
 # -----------------------------
 # Extraction & Analysis
 # -----------------------------
-def analyze_url(url: str, use_js=False, exclude_toc=True, require_nonempty_anchor=True, want_psi=False, psi_key=None, keywords_raw:str=""):
-    html_text, fetch_ms, html_bytes, did_js, renderer = fetch_html(url, use_js)
+def analyze_url(url: str, use_js=False, exclude_toc=True, require_nonempty_anchor=True, want_psi=False, psi_key=None, keywords_raw:str="", wait_selector_input: str | None = None):
+    wait_selectors = None
+    if wait_selector_input and wait_selector_input.strip():
+        # Support comma/line separated selectors
+        wait_selectors = [s.strip() for s in re.split(r"[\n,]+", wait_selector_input) if s.strip()]
+    else:
+        # Add a Snowflake-friendly default hint
+        wait_selectors = [
+            ".markdown-body",
+            "article",
+            "main article",
+            "main [class*='content']",
+            "main [data-component]",
+        ]
+    html_text, fetch_ms, html_bytes, did_js, renderer = fetch_html(url, use_js, wait_selectors=wait_selectors)
     soup = BeautifulSoup(html_text, "html.parser")
 
     # If content still looks empty, try <noscript> fallback
@@ -1128,6 +1169,8 @@ with st.sidebar:
 
     js = st.checkbox("Enable JavaScript rendering (manual boost)", value=False,
                      help="The app auto-detects CSR pages and renders JS anyway. Enable to force JS render early.")
+    wait_selector = st.text_input("Wait for selector (optional)",
+                                  help="CSS selector(s), comma or line separated, to wait for before snapshot. Example: main article, .markdown-body")
 
     st.markdown("---")
     st.subheader("Core Web Vitals")
@@ -1152,7 +1195,8 @@ if run:
                 use_js=js,
                 want_psi=want_psi_switch,
                 psi_key=(psi_key_manual or None),
-                keywords_raw=keywords_input or ""
+                keywords_raw=keywords_input or "",
+                wait_selector_input=wait_selector or None
             )
             score, cat_df, breakdown, recs = score_page(signals)
         except requests.exceptions.RequestException as e:
@@ -1291,4 +1335,3 @@ if run:
         })
 else:
     st.info("Enter a URL + optional target keywords in the sidebar and click **Run Analysis**.")
-
