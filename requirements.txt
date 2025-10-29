@@ -1,9 +1,12 @@
-streamlit>=1.36
-beautifulsoup4>=4.12
+streamlit>=1.33
 requests>=2.31
+beautifulsoup4>=4.12
 tldextract>=5.1
 python-dateutil>=2.9
-pandas>=2.2
+plotly>=5.22
 requests-html>=0.10.0
 pyppeteer>=1.0
+openai>=1.30.0
+pandas>=2.2
+
 
