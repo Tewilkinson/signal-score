@@ -418,7 +418,8 @@ async def _pyppeteer_render_aggressive(url: str, timeout=70, scroll_steps=14, wa
                     });
                 })(document);
             """)
-        except Exception {}
+        except Exception:
+            pass
 
         # Attempt to harvest same-origin iframes content using Readability and append stubs
         try:
