@@ -37,6 +37,13 @@ try:
 except Exception:
     PYPP_OK = False
 
+# Streamlit often runs an active asyncio loop; allow nested awaits when needed
+try:
+    import nest_asyncio  # type: ignore
+    nest_asyncio.apply()
+except Exception:
+    pass
+
 # Optional OpenAI embeddings
 OPENAI_OK = False
 _openai_client = None
@@ -274,7 +281,16 @@ def render_with_pyppeteer(url: str, timeout=40) -> str:
     if not PYPP_OK:
         raise RuntimeError("pyppeteer not installed")
     import asyncio
-    return asyncio.get_event_loop().run_until_complete(_pyppeteer_render(url, timeout=timeout))
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # With nest_asyncio applied above, we can safely run until complete
+            return loop.run_until_complete(_pyppeteer_render(url, timeout=timeout))
+        else:
+            return loop.run_until_complete(_pyppeteer_render(url, timeout=timeout))
+    except RuntimeError:
+        # No current event loop; use asyncio.run
+        return asyncio.run(_pyppeteer_render(url, timeout=timeout))
 
 def fetch_html(url: str, use_js: bool):
     """
@@ -300,7 +316,8 @@ def fetch_html(url: str, use_js: bool):
     soup_probe = BeautifulSoup(html_text, "html.parser")
     body_text = (soup_probe.body.get_text(" ", strip=True) if soup_probe.body else "")
     wordish = len(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]{3,}", body_text))
-    looks_csr_shell = (html_bytes < 60_000) or (wordish < 120)
+    has_mainish_tag = bool(soup_probe.find(["article","main"]))
+    looks_csr_shell = (html_bytes < 60_000) or (wordish < 160) or (not has_mainish_tag)
 
     def _looks_empty(htm):
         sp = BeautifulSoup(htm or "", "html.parser")
@@ -400,7 +417,7 @@ def visible_anchor_text(a):
 
 def extract_text_blocks(node):
     texts = []
-    for tag in node.find_all(["p","li","h1","h2","h3","blockquote"]):
+    for tag in node.find_all(["p","li","h1","h2","h3","h4","h5","h6","blockquote","figcaption","pre","td","th"]):
         t = clean_text(tag.get_text(" ", strip=True))
         if t:
             texts.append(t)
@@ -1274,3 +1291,4 @@ if run:
         })
 else:
     st.info("Enter a URL + optional target keywords in the sidebar and click **Run Analysis**.")
+
