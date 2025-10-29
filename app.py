@@ -1,5 +1,7 @@
 # app.py — SignalScore Content (SEO Suite)
+
 # CSR auto-render (requests-html → Pyppeteer fallback) + PSI-first UX scoring + OpenAI keyword relevance
+
 import re
 import os
 import json
@@ -229,7 +231,8 @@ async def _pyppeteer_render(url: str, timeout=40, scroll_steps=8, wait_selectors
     if wait_selectors is None:
         wait_selectors = [
             ".aem-Grid", ".article", "article", "main",
-            "[data-cmp-hook-richtext='text']", ".content", ".post-content", ".entry-content"
+            "[data-cmp-hook-richtext='text']", ".content", ".post-content", ".entry-content",
+            "[role='main']", ".prose", ".markdown-body"
         ]
     browser = await launch(
         headless=True,
@@ -257,7 +260,7 @@ async def _pyppeteer_render(url: str, timeout=40, scroll_steps=8, wait_selectors
                 continue
 
         # One extra idle wait to let late hydration finish
-        await page.waitForTimeout(800)
+        await page.waitForTimeout(1200)
 
         content = await page.content()
         return content
@@ -533,7 +536,7 @@ def compute_keyword_relevance(full_text: str, h1: str, h2s: list[str], keywords_
 # -----------------------------
 # Extraction & Analysis
 # -----------------------------
-def analyze_url(url: str, use_js=False, exclude_toc=True, require_nonempty_anchor=False, want_psi=False, psi_key=None, keywords_raw:str=""):
+def analyze_url(url: str, use_js=False, exclude_toc=True, require_nonempty_anchor=True, want_psi=False, psi_key=None, keywords_raw:str=""):
     html_text, fetch_ms, html_bytes, did_js, renderer = fetch_html(url, use_js)
     soup = BeautifulSoup(html_text, "html.parser")
 
@@ -845,6 +848,9 @@ def analyze_url(url: str, use_js=False, exclude_toc=True, require_nonempty_ancho
         "ux": ux,
         "kw_df": kw_df,
         "kw_agg": kw_agg,
+        # Expose content for rendering
+        "full_text": full_text,
+        "text_blocks": text_blocks,
     }
 
 # -----------------------------
@@ -857,36 +863,36 @@ def score_page(s: dict):
         "h_structure": 5,
         "content_depth": 8,
         "readability": 4,
-        "url_evergreen": 2,  # 6+5+8+4+2 = 25
-        "lead_priority": 0,  # moved lead to on-page depth proxy above earlier, keep at 0 or fold into content_depth logic
+        "url_evergreen": 2,
+        "lead_priority": 0,
 
-        # Links in content — folded into On-page above (kept in breakdown table but weight 0 here)
+        # Links/media — shown but weight here 0
         "internal_links": 0,
         "external_links": 0,
         "image_alts": 0,
         "internal_anchor_quality": 0,
         "internal_semantic": 0,
 
-        # E-E-A-T proxies — 25
+        # E-E-A-T — 25
         "author": 6,
         "org_schema": 4,
         "person_schema": 3,
         "jsonld": 4,
         "about_contact": 4,
-        "citations": 4,  # 6+4+3+4+4+4 = 25
+        "citations": 4,
 
         # UX / Speed — 20
         "ux_perf": 9,
         "ux_lcp": 4,
         "ux_cls": 3,
-        "ux_inp": 4,  # 9+4+3+4 = 20
+        "ux_inp": 4,
 
         # Originality / Effort — 20
         "no_stuffing": 5,
         "originality": 7,
-        "content_effort": 8,  # 5+7+8 = 20
+        "content_effort": 8,
 
-        # Freshness / Canonical — fold into On-page (weight 0 here but show in table)
+        # Freshness / Canonical — 0
         "fresh_pub": 0,
         "fresh_mod": 0,
         "canonical_ok": 0,
@@ -897,7 +903,7 @@ def score_page(s: dict):
         "kw_relevance": 10,
     }
 
-    # Compute individual signals (as before)
+    # Compute individual signals
     recs = []
     pts = 0.0
 
@@ -1002,7 +1008,7 @@ def score_page(s: dict):
     effort = s.get("content_effort_score",0.0)
     if effort < 0.6: recs.append("Add images (with alts), embed video, include schema & clear authorship.")
 
-    # --- Freshness / Canonical (recommendations only here) ---
+    # --- Freshness / Canonical (recommendations only) ---
     mp = s.get("months_since_pub", math.inf)
     if mp > 24: recs.append("Refresh old content or add a clear ‘last updated’ if materially revised.")
     mm = s.get("months_since_mod", math.inf)
@@ -1043,7 +1049,7 @@ def score_page(s: dict):
     kw_cat_points = kw_points*10
 
     total_points = onpage_points + eeat_points + ux_points + oe_points + kw_cat_points
-    score_100 = round(total_points, 1)  # already normalized to 100 via category caps
+    score_100 = round(total_points, 1)
 
     # Build category breakdown DF
     cat_df = pd.DataFrame([
@@ -1054,7 +1060,7 @@ def score_page(s: dict):
         ["Keyword Relevance", round(kw_cat_points,2), 10],
     ], columns=["Category","Points","Max"])
 
-    # Flat breakdown table for transparency (optional to display)
+    # Flat breakdown table for transparency
     detail_rows = [
         ("Title / Intent", round(title_ok*6,2), 6),
         ("Heading Structure", round(h_ok*5,2), 5),
@@ -1105,10 +1111,6 @@ with st.sidebar:
 
     js = st.checkbox("Enable JavaScript rendering (manual boost)", value=False,
                      help="The app auto-detects CSR pages and renders JS anyway. Enable to force JS render early.")
-    exclude_toc = st.checkbox("Exclude Table of Contents links", value=True,
-                              help="Skips #fragment links and links inside toc/table-of-contents wrappers.")
-    require_nonempty_anchor = st.checkbox("Require non-empty anchor text", value=False,
-                              help="Ignore links with no visible/title/aria/img-alt text.")
 
     st.markdown("---")
     st.subheader("Core Web Vitals")
@@ -1131,8 +1133,6 @@ if run:
             signals = analyze_url(
                 url,
                 use_js=js,
-                exclude_toc=exclude_toc,
-                require_nonempty_anchor=require_nonempty_anchor,
                 want_psi=want_psi_switch,
                 psi_key=(psi_key_manual or None),
                 keywords_raw=keywords_input or ""
@@ -1166,8 +1166,9 @@ if run:
         perf = signals["ux"].get("perf_score")
         st.metric("UX Perf (0–1)", f"{perf:.2f}" if perf is not None else "—")
 
+    # Tabs: Category Breakdown, Content, Signals, Keyword Relevance, Recommendations, Debug
     tab1,tab2,tab3,tab4,tab5,tab6 = st.tabs([
-        "Category Breakdown","Signals","Keyword Relevance","Recommendations","Detailed Breakdown","Debug"
+        "Category Breakdown","Content","Signals","Keyword Relevance","Recommendations","Debug"
     ])
 
     with tab1:
@@ -1175,7 +1176,19 @@ if run:
         st.dataframe(cat_df, use_container_width=True, hide_index=True)
         st.caption("Points vs Max per category. The overall score sums all category points (max 100).")
 
+        st.markdown("### Signal Breakdown (with points and max)")
+        st.dataframe(breakdown, use_container_width=True, hide_index=True)
+
     with tab2:
+        st.subheader("Main Content")
+        ft = signals.get("full_text") or ""
+        if ft.strip():
+            preview = ft[:5000] + ("..." if len(ft) > 5000 else "")
+            st.text(preview)
+        else:
+            st.info("No main content text detected after rendering. Try enabling JavaScript rendering or check if the page is heavily client-rendered.")
+
+    with tab3:
         st.subheader("Extracted Signals")
         colA,colB = st.columns([2,1])
         with colA:
@@ -1222,7 +1235,7 @@ if run:
             if signals["ld_types"]:
                 st.markdown("**Detected schema.org @type:** " + ", ".join(signals["ld_types"]))
 
-    with tab3:
+    with tab4:
         st.subheader("Keyword Relevance (per input)")
         kw_df = signals.get("kw_df")
         if kw_df is not None and not kw_df.empty:
@@ -1232,41 +1245,21 @@ if run:
         else:
             st.info("Enter target keywords in the sidebar to compute per-keyword relevance.")
 
-    with tab4:
+    with tab5:
         st.subheader("Top Recommendations")
         if recs:
             for r in recs: st.markdown(f"- {r}")
         else:
             st.info("Nice! No immediate gaps detected based on current heuristics.")
+        # Keyword-specific recommendations for weak coverage
+        kw_df = signals.get("kw_df")
+        if kw_df is not None and not kw_df.empty:
+            weak = kw_df[(kw_df["Relevance"].fillna(0) < 0.7)]
+            if not weak.empty:
+                st.markdown("**Keyword-specific recommendations:**")
+                for _, row in weak.iterrows():
+                    st.markdown(f"- {row['Keyword']}: {row['Recommendation']}")
         st.caption("CWV shown when available from PageSpeed Insights. Otherwise, heuristic UX score is used. Keyword relevance blends OpenAI semantic similarity (if API key present) with lexical coverage.")
-
-    with tab5:
-        st.subheader("Detailed Breakdown (Why you scored this way)")
-        onpage = cat_df.loc[cat_df["Category"]=="On-Page","Points"].values[0]
-        eeat = cat_df.loc[cat_df["Category"]=="E-E-A-T","Points"].values[0]
-        uxsp = cat_df.loc[cat_df["Category"]=="UX / Speed","Points"].values[0]
-        oe = cat_df.loc[cat_df["Category"]=="Originality / Effort","Points"].values[0]
-        kwp = cat_df.loc[cat_df["Category"]=="Keyword Relevance","Points"].values[0]
-
-        st.markdown("### On-Page (max 25)")
-        st.markdown("- Title/H1 alignment, heading hierarchy, depth (~800–1800 words), readability (FRE), evergreen URL.")
-        st.markdown(f"**Awarded:** {onpage:.1f}/25")
-
-        st.markdown("### E-E-A-T (max 25)")
-        st.markdown("- Clear author attribution, Organization/Person schema, Article JSON-LD, About/Contact presence, reputable citations.")
-        st.markdown(f"**Awarded:** {eeat:.1f}/25")
-
-        st.markdown("### UX / Speed (max 20)")
-        st.markdown("- PageSpeed performance score (mobile), LCP, CLS, INP (field preferred; lab fallback); otherwise heuristic based on size/media/scripts/fetch time.")
-        st.markdown(f"**Awarded:** {uxsp:.1f}/20")
-
-        st.markdown("### Originality / Effort (max 20)")
-        st.markdown("- No keyword stuffing, vocabulary/structure diversity, images with alts, video embeds, author/schema presence.")
-        st.markdown(f"**Awarded:** {oe:.1f}/20")
-
-        st.markdown("### Keyword Relevance (max 10)")
-        st.markdown("- OpenAI embeddings (`text-embedding-3-small`) for semantic coverage + lexical matches/density.")
-        st.markdown(f"**Awarded:** {kwp:.1f}/10")
 
     with tab6:
         st.subheader("Debug / Raw")
