@@ -1,8 +1,9 @@
-# app.py — SignalScore Content (SEO Suite)
+# app.py — SignalScore Content (SEO Suite) with UX/Speed + CWV
 import re
 import json
 import math
 import html
+import time
 import urllib.parse
 from collections import Counter
 from datetime import datetime, timezone
@@ -34,7 +35,6 @@ HEADERS = {
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
-
 ABS_TIMEOUT = 25
 
 DATE_META_KEYS = [
@@ -57,7 +57,7 @@ AUTHOR_META_KEYS = [
     ("div", {"class": re.compile(r"author", re.I)}),
 ]
 
-# Expanded nav-like detector (names + classes/ids)
+# Expanded nav-like detector
 NAV_LIKE = re.compile(
     r"(nav|menu|breadcrumb|footer|toc|table-of-contents|sidebar|aside|"
     r"pagination|pager|next-prev|share|social|subscribe|cookie|banner|"
@@ -179,15 +179,25 @@ def render_with_js(url: str, timeout=ABS_TIMEOUT) -> str:
     r.html.render(timeout=timeout*1000, sleep=1)
     return r.html.html
 
-def fetch_html(url: str, use_js: bool) -> str:
+def fetch_html(url: str, use_js: bool):
+    start = time.time()
+    html_text = None
+    js_render_ms = None
     if use_js:
         try:
-            return render_with_js(url)
+            html_text = render_with_js(url)
+            js_render_ms = int((time.time() - start) * 1000)
         except Exception:
-            pass  # fallback
-    r = requests.get(url, headers=HEADERS, timeout=ABS_TIMEOUT)
-    r.raise_for_status()
-    return r.text
+            html_text = None
+    if html_text is None:
+        start = time.time()
+        r = requests.get(url, headers=HEADERS, timeout=ABS_TIMEOUT)
+        r.raise_for_status()
+        html_text = r.text
+        js_render_ms = int((time.time() - start) * 1000)
+    # Byte size (rough proxy)
+    html_bytes = len(html_text.encode("utf-8", errors="ignore"))
+    return html_text, js_render_ms, html_bytes
 
 def extract_ldjson(soup: BeautifulSoup):
     blobs = []
@@ -213,7 +223,7 @@ def extract_main_content(soup: BeautifulSoup):
         best = max(candidates, key=lambda c: len(c.get_text(" ", strip=True)))
         return best
     body = soup.body or soup
-    # strip obvious nav/footer/aside (leave header; treat global header separately later)
+    # strip obvious nav/footer/aside
     for tag in body.find_all(["nav","footer","aside"]):
         tag.extract()
     for tag in body.find_all(True, class_=NAV_LIKE):
@@ -226,32 +236,26 @@ def is_in_navigation_context(tag) -> bool:
     """
     Skip links inside true navigation/utility regions.
     - Treat <nav>, <footer>, <aside> as navigation.
-    - Treat <header> as navigation ONLY if it's a direct child of <body> (global site header).
+    - Treat <header> as navigation ONLY if it's a direct child of <body>.
     - Also skip ancestors whose class/id matches NAV_LIKE.
-    - If we hit <article> or role='main', we assume we're in content and stop checking.
+    - If we hit <article> or role='main', assume content and stop checking.
     """
     for parent in tag.parents:
         name = getattr(parent, "name", None)
         if not name:
             continue
-
-        # Stop early if we've reached the content root
         if name in {"article", "main"} or (parent.get("role") == "main") or (parent.get("itemprop") == "articleBody"):
             return False
-
         if name in {"nav", "footer", "aside"}:
             return True
         if name == "header":
-            # Only treat as nav if global (direct child of body)
             gp = getattr(parent, "parent", None)
             if gp is not None and getattr(gp, "name", None) == "body":
                 return True
-
         cls = " ".join(parent.get("class") or [])
         pid = parent.get("id") or ""
         if NAV_LIKE.search(cls) or NAV_LIKE.search(pid):
             return True
-
     return False
 
 def visible_anchor_text(a):
@@ -275,11 +279,82 @@ def extract_text_blocks(node):
             texts.append(t)
     return texts
 
+# ------------- PageSpeed Insights (CWV) -------------
+def fetch_pagespeed(url: str, api_key: str | None):
+    """
+    Returns dict with:
+      - perf_score (0..1), lab metrics (FCP, LCP, CLS, SI, TTI, TBT)
+      - field metrics (LCP_p75, CLS_p75, INP_p75) when available
+    Strategy: mobile
+    """
+    base = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
+    params = {
+        "url": url,
+        "strategy": "mobile",
+        "category": "PERFORMANCE",
+    }
+    if api_key:
+        params["key"] = api_key.strip()
+    try:
+        r = requests.get(base, params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+    except Exception:
+        return {"ok": False}
+
+    out = {"ok": True}
+    try:
+        lh = data.get("lighthouseResult", {})
+        cats = lh.get("categories", {})
+        out["perf_score"] = cats.get("performance", {}).get("score", None)  # 0..1
+        audits = lh.get("audits", {})
+        def val(id_):
+            v = audits.get(id_, {}).get("numericValue")
+            return float(v) if v is not None else None
+        out["lab"] = {
+            "FCP_ms": val("first-contentful-paint"),
+            "LCP_ms": val("largest-contentful-paint"),
+            "CLS": audits.get("cumulative-layout-shift", {}).get("numericValue"),
+            "SI_ms": val("speed-index"),
+            "TTI_ms": val("interactive"),
+            "TBT_ms": val("total-blocking-time"),
+        }
+    except Exception:
+        pass
+
+    # Field (CrUX) metrics
+    try:
+        le = data.get("loadingExperience", {})
+        metrics = le.get("metrics", {})
+        def p75(id_):
+            m = metrics.get(id_, {})
+            p = m.get("percentile")
+            return float(p) if p is not None else None
+        out["field"] = {
+            "LCP_ms_p75": p75("LARGEST_CONTENTFUL_PAINT_MS"),
+            "CLS_p75": (metrics.get("CUMULATIVE_LAYOUT_SHIFT_SCORE", {}).get("percentile", None)),
+            "INP_ms_p75": p75("INTERACTION_TO_NEXT_PAINT"),
+        }
+    except Exception:
+        pass
+    return out
+
+def normalize_ms(value, good, poor):
+    """Map a metric (ms) to 0..1 where >=poor -> 0, <=good -> 1."""
+    if value is None:
+        return None
+    if value <= good:
+        return 1.0
+    if value >= poor:
+        return 0.0
+    # linear between
+    return max(0.0, min(1.0, (poor - value) / (poor - good)))
+
 # -----------------------------
 # Extraction & Analysis
 # -----------------------------
-def analyze_url(url: str, use_js=False, exclude_toc=True, require_nonempty_anchor=False):
-    html_text = fetch_html(url, use_js)
+def analyze_url(url: str, use_js=False, exclude_toc=True, require_nonempty_anchor=False, want_psi=False, psi_key=None):
+    html_text, fetch_ms, html_bytes = fetch_html(url, use_js)
     soup = BeautifulSoup(html_text, "html.parser")
 
     base_domain = get_domain(url)
@@ -316,20 +391,18 @@ def analyze_url(url: str, use_js=False, exclude_toc=True, require_nonempty_ancho
     word_count = len(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", full_text))
     reading_ease = flesch_reading_ease(full_text)
 
-    # ----- Link collection (content area) -----
+    # ----- Links: in-content (skip nav/footer/aside & nav-like) -----
+    internal_links, external_links, internal_anchor_texts = [], [], []
     def collect_links(root):
-        internal_links, external_links, internal_anchor_texts = [], [], []
+        _i, _e, _t = [], [], []
         for a in root.find_all("a", href=True):
             if is_in_navigation_context(a):
-                continue  # ignore nav/footer/etc.
+                continue
             href = absolute_url(a["href"], url)
             txt = visible_anchor_text(a).lower()
-
-            # Optional TOC exclusion
             if exclude_toc:
                 if href.endswith("#") or urllib.parse.urlparse(href).fragment:
                     continue
-                # skip ToC-like ancestors
                 chain = []
                 for p in a.parents:
                     chain.extend(p.get("class") or [])
@@ -337,24 +410,16 @@ def analyze_url(url: str, use_js=False, exclude_toc=True, require_nonempty_ancho
                     if pid: chain.append(pid)
                 if re.search(r"(toc|table-of-contents|jump\-links|page\-contents)", " ".join(chain), re.I):
                     continue
-
             if require_nonempty_anchor and not txt:
                 continue
-
             if is_internal(href, base_domain):
-                internal_links.append(href)
-                internal_anchor_texts.append(txt)
+                _i.append(href); _t.append(txt)
             else:
-                external_links.append(href)
-        return internal_links, external_links, internal_anchor_texts
-
-    # First pass: within main/article/body (our extracted main)
+                _e.append(href)
+        return _i, _e, _t
     internal_links, external_links, internal_anchor_texts = collect_links(main)
-
-    # Fallback pass: if nothing found (some CMS markups are odd), sweep whole soup
     if not internal_links and not external_links:
-        all_internal, all_external, all_texts = collect_links(soup)
-        internal_links, external_links, internal_anchor_texts = all_internal, all_external, all_texts
+        internal_links, external_links, internal_anchor_texts = collect_links(soup)
 
     # ----- Internal anchor text quality -----
     descriptive = 0
@@ -362,15 +427,10 @@ def analyze_url(url: str, use_js=False, exclude_toc=True, require_nonempty_ancho
         words = [w for w in re.findall(r"[a-zA-ZÀ-ÖØ-öø-ÿ]+", txt) if w not in STOPWORDS]
         if not txt or txt in GENERIC_ANCHORS:
             continue
-        if len(words) >= 3:
-            descriptive += 1
-        elif words:
-            descriptive += 0.6
-    internal_anchor_quality = 0.0
-    if internal_anchor_texts:
-        internal_anchor_quality = min(1.0, descriptive / len(internal_anchor_texts))
+        descriptive += 1 if len(words) >= 3 else (0.6 if words else 0)
+    internal_anchor_quality = min(1.0, descriptive / len(internal_anchor_texts)) if internal_anchor_texts else 0.0
 
-    # ----- Internal semantic relatedness (URL slug context vs page terms) -----
+    # ----- Internal semantic relatedness -----
     page_terms = [t for t,_ in top_terms(full_text, n=40)]
     page_term_set = set(page_terms)
     sims = []
@@ -401,13 +461,18 @@ def analyze_url(url: str, use_js=False, exclude_toc=True, require_nonempty_ancho
     img_count = len(images)
     with_alt = sum(1 for im in images if (im.get("alt") and clean_text(im.get("alt"))))
     img_alt_pct = (with_alt / img_count) if img_count else 0.0
-
     videos = main.find_all(["video","iframe"])
     video_like = 0
     for v in videos:
         src = (v.get("src") or "").lower()
         if any(host in src for host in ["youtube","vimeo","wistia","loom"]):
             video_like += 1
+
+    # ----- Scripts (for heuristic UX fallback) -----
+    script_srcs = [s.get("src") for s in soup.find_all("script", src=True)]
+    third_party_scripts = [u for u in script_srcs if u and not is_internal(absolute_url(u, url), get_domain(url))]
+    # inline scripts count
+    inline_scripts = len([s for s in soup.find_all("script") if not s.get("src")])
 
     # ----- Author detection -----
     author_present = False
@@ -439,7 +504,6 @@ def analyze_url(url: str, use_js=False, exclude_toc=True, require_nonempty_ancho
                     dt = try_parse_date(txt)
                     if dt: return dt
         return None
-
     published_dt = find_first_date(DATE_META_KEYS)
     modified_dt = find_first_date(MODIFIED_META_KEYS)
 
@@ -506,6 +570,46 @@ def analyze_url(url: str, use_js=False, exclude_toc=True, require_nonempty_ancho
     months_pub = months_since(published_dt)
     months_mod = months_since(modified_dt)
 
+    # ----- PageSpeed / CWV -----
+    psi = fetch_pagespeed(url, psi_key) if want_psi else {"ok": False}
+    # Lab defaults
+    lab_perf = psi.get("perf_score", None) if psi.get("ok") else None  # 0..1
+    lab_LCP = psi.get("lab",{}).get("LCP_ms") if psi.get("ok") else None
+    lab_CLS = psi.get("lab",{}).get("CLS") if psi.get("ok") else None
+    # Field p75 (preferred when present)
+    field_LCP = psi.get("field",{}).get("LCP_ms_p75") if psi.get("ok") else None
+    field_CLS = psi.get("field",{}).get("CLS_p75") if psi.get("ok") else None
+    field_INP = psi.get("field",{}).get("INP_ms_p75") if psi.get("ok") else None
+
+    # Fallback heuristic score if PSI missing: HTML size + images+videos + scripts + fetch time
+    heuristic_perf = None
+    if not psi.get("ok"):
+        # scale: smaller html, fewer heavy elements, fewer third-party scripts, faster fetch → better
+        # Normalize to 0..1 with soft thresholds
+        size_score = 1.0 if html_bytes <= 200_000 else 0.7 if html_bytes <= 500_000 else 0.4 if html_bytes <= 1_000_000 else 0.2
+        media_pen = min(1.0, (img_count + video_like*3) / 20)  # more media → slower
+        media_score = 1.0 - 0.6*media_pen
+        scripts_pen = min(1.0, (len(third_party_scripts)/10) + (inline_scripts/40))
+        scripts_score = 1.0 - 0.7*scripts_pen
+        fetch_score = 1.0 if fetch_ms <= 800 else 0.7 if fetch_ms <= 1600 else 0.4 if fetch_ms <= 3000 else 0.2
+        heuristic_perf = max(0.0, min(1.0, 0.35*size_score + 0.25*media_score + 0.25*scripts_score + 0.15*fetch_score))
+
+    ux = {
+        "psi_ok": psi.get("ok", False),
+        "perf_score": lab_perf if lab_perf is not None else heuristic_perf,
+        "LCP_ms": field_LCP if field_LCP is not None else lab_LCP,
+        "CLS": field_CLS if field_CLS is not None else lab_CLS,
+        "INP_ms": field_INP,  # may be None
+        "FCP_ms": psi.get("lab",{}).get("FCP_ms") if psi.get("ok") else None,
+        "TTI_ms": psi.get("lab",{}).get("TTI_ms") if psi.get("ok") else None,
+        "TBT_ms": psi.get("lab",{}).get("TBT_ms") if psi.get("ok") else None,
+        "SI_ms": psi.get("lab",{}).get("SI_ms") if psi.get("ok") else None,
+        "fetch_time_ms": fetch_ms,
+        "html_bytes": html_bytes,
+        "third_party_scripts": len(third_party_scripts),
+        "inline_scripts": inline_scripts,
+    }
+
     # Summarize
     return {
         "title": title, "meta_desc": meta_desc, "h1": h1, "h2s": h2s,
@@ -526,6 +630,7 @@ def analyze_url(url: str, use_js=False, exclude_toc=True, require_nonempty_ancho
         "stuffing_risk": stuffing_risk,
         "originality_score": originality_score,
         "content_effort_score": content_effort_score,
+        "ux": ux,
     }
 
 # -----------------------------
@@ -567,6 +672,12 @@ def score_page(s: dict):
         "stuffing_penalty": 3,
         "originality": 2,
         "content_effort": 2,
+
+        # NEW: UX & Speed — 15
+        "ux_perf": 7,
+        "ux_lcp": 3,
+        "ux_cls": 2,
+        "ux_inp": 3,
     }
     max_points = sum(weights.values())
     pts = 0.0
@@ -643,7 +754,7 @@ def score_page(s: dict):
 
     isem = s.get("internal_semantic_score",0.0)
     pts += isem * weights["internal_semantic"]
-    if isem < 0.6: recs.append("Link to semantically related internal URLs (align slugs with page key entities/topics).")
+    if isem < 0.6: recs.append("Link to semantically related internal URLs (align slugs with key entities/topics).")
 
     # E-E-A-T proxies
     ap = 1.0 if s.get("author_present") else 0.0
@@ -709,7 +820,44 @@ def score_page(s: dict):
 
     effort = s.get("content_effort_score",0.0)
     pts += effort * weights["content_effort"]
-    if effort < 0.6: recs.append("Increase content effort: add images (with alts), embed video, include schema & clear authorship.")
+    if effort < 0.6: recs.append("Add images (with alts), embed video, include schema & clear authorship.")
+
+    # --- NEW: UX & Speed ---
+    ux = s.get("ux", {})
+    perf = ux.get("perf_score")  # 0..1 (PSI) or heuristic 0..1
+    if perf is None:
+        perf = 0.5
+        recs.append("Could not fetch PageSpeed; consider adding PSI API key to get real CWV-backed scoring.")
+    pts += perf * weights["ux_perf"]
+
+    # LCP (good <= 2500ms, poor >= 4000ms)
+    lcp = ux.get("LCP_ms")
+    lcp_score = normalize_ms(lcp, 2500, 4000)
+    if lcp_score is None:
+        lcp_score = 0.6
+    else:
+        if lcp_score < 0.8:
+            recs.append("Improve LCP: optimize hero image, reduce render-blocking JS/CSS, use critical CSS and lazy-load below-the-fold.")
+    pts += lcp_score * weights["ux_lcp"]
+
+    # CLS (good <= 0.1, poor >= 0.25) — here we invert since smaller is better
+    cls = ux.get("CLS")
+    if cls is None:
+        cls_score = 0.6
+    else:
+        if cls <= 0.1: cls_score = 1.0
+        elif cls >= 0.25: cls_score = 0.0
+        else: cls_score = (0.25 - cls) / (0.25 - 0.1)
+        if cls_score < 0.8:
+            recs.append("Reduce CLS: always set image/video dimensions, reserve space for embeds/ads, avoid injecting DOM above content.")
+    pts += cls_score * weights["ux_cls"]
+
+    # INP (good <= 200ms, poor >= 500ms)
+    inp = ux.get("INP_ms")
+    inp_score = normalize_ms(inp, 200, 500) if inp is not None else 0.6
+    if inp is not None and inp_score < 0.8:
+        recs.append("Improve responsiveness (INP): minimize long tasks, split bundles, hydrate interactives lazily.")
+    pts += inp_score * weights["ux_inp"]
 
     score_100 = round(pts / max_points * 100, 1)
 
@@ -739,20 +887,24 @@ def score_page(s: dict):
         ("No Stuffing", round(stuffing*weights["stuffing_penalty"],2), weights["stuffing_penalty"]),
         ("Originality", round(orig*weights["originality"],2), weights["originality"]),
         ("Content Effort", round(effort*weights["content_effort"],2), weights["content_effort"]),
+        ("UX: Performance", round(perf*weights["ux_perf"],2), weights["ux_perf"]),
+        ("UX: LCP", round(lcp_score*weights["ux_lcp"],2), weights["ux_lcp"]),
+        ("UX: CLS", round(cls_score*weights["ux_cls"],2), weights["ux_cls"]),
+        ("UX: INP", round(inp_score*weights["ux_inp"],2), weights["ux_inp"]),
     ], columns=["Signal","Points Awarded","Max Points"])
 
-    # dedupe recs, cap at 12
+    # dedupe recs, cap at 14
     seen=set(); uniq=[]
     for r in recs:
         if r not in seen:
             uniq.append(r); seen.add(r)
-    return score_100, breakdown, uniq[:12]
+    return score_100, breakdown, uniq[:14]
 
 # -----------------------------
 # UI
 # -----------------------------
 st.title("📶 SignalScore Content")
-st.caption("Heuristic content quality, E-E-A-T, and on-page scoring (0–100) with transparent signals.")
+st.caption("Heuristic content quality, E-E-A-T, UX/Speed, and on-page scoring (0–100) with transparent signals.")
 
 with st.sidebar:
     st.header("Analyze a Page")
@@ -763,10 +915,16 @@ with st.sidebar:
                               help="Skips #fragment links and links inside toc/table-of-contents wrappers.")
     require_nonempty_anchor = st.checkbox("Require non-empty anchor text", value=False,
                               help="Ignore links with no visible/title/aria/img-alt text.")
+    st.markdown("---")
+    st.subheader("Core Web Vitals")
+    want_psi = st.checkbox("Fetch Google PageSpeed (mobile)", value=True,
+                           help="Retrieves performance score and CWV (LCP/CLS/INP) using PSI API.")
+    psi_key = st.text_input("PageSpeed API Key (optional)", type="password",
+                            help="Recommended for reliability; leave blank to try without.")
     ua = st.text_input("Custom User-Agent (optional)", value=HEADERS["User-Agent"])
     run = st.button("Run Analysis", type="primary")
     st.markdown("---")
-    st.caption("Counts in-content links across the page (div/section/li, etc.), excluding global nav/footer/aside & nav-like wrappers. Falls back to full-page sweep if needed.")
+    st.caption("In-content links across the page (div/section/li, etc.) are counted, excluding global nav/footer/aside & nav-like wrappers.")
 
 if run:
     if not url:
@@ -775,7 +933,11 @@ if run:
         try:
             if ua and ua.strip():
                 HEADERS["User-Agent"] = ua.strip()
-            signals = analyze_url(url, use_js=js, exclude_toc=exclude_toc, require_nonempty_anchor=require_nonempty_anchor)
+            signals = analyze_url(
+                url, use_js=js, exclude_toc=exclude_toc,
+                require_nonempty_anchor=require_nonempty_anchor,
+                want_psi=want_psi, psi_key=psi_key or None
+            )
             score, breakdown, recs = score_page(signals)
         except requests.exceptions.RequestException as e:
             st.error(f"Network error: {e}"); st.stop()
@@ -790,7 +952,9 @@ if run:
     with c2: st.metric("Readability (FRE)", f"{signals['reading_ease']:.0f}")
     with c3: st.metric("Internal Links (content)", str(len(signals["p_internal_links"])))
     with c4: st.metric("External Links (content)", str(len(signals["p_external_links"])))
-    with c5: st.metric("Lead Score", f"{signals['lead_score']:.2f}")
+    with c5:
+        perf = signals["ux"].get("perf_score")
+        st.metric("UX Perf (0–1)", f"{perf:.2f}" if perf is not None else "—")
 
     tab1,tab2,tab3,tab4 = st.tabs(["Score Breakdown","Signals","Recommendations","Debug"])
 
@@ -822,17 +986,23 @@ if run:
             st.markdown(f"**Originality Score (heuristic):** {signals['originality_score']:.2f}")
             st.markdown(f"**Content Effort Score:** {signals['content_effort_score']:.2f}")
         with colB:
-            st.markdown("**Technical / Meta**")
+            st.markdown("**Technical / Meta & UX**")
+            ux = signals["ux"]
             st.write(pd.DataFrame({
                 "Key":[
                     "Viewport Meta","Canonical Present","Canonical Off-site",
                     "Robots Noindex","JSON-LD Present","Org Schema","Person Schema",
-                    "URL Has Year","URL Has Date","Images (count)","Images w/ Alt %","Videos (embeds)"
+                    "URL Has Year","URL Has Date","Images (count)","Images w/ Alt %","Videos (embeds)",
+                    "Perf Score (PSI/heuristic)","LCP (ms)","CLS","INP (ms)",
+                    "Fetch Time (ms)","HTML Size (bytes)","3P Scripts","Inline Scripts"
                 ],
                 "Value":[
                     signals["viewport_ok"], bool(signals["canonical"]), signals["canonical_offsite"],
                     signals["robots_noindex"], signals["jsonld_present"], signals["org_schema"], signals["person_schema"],
-                    signals["url_has_year"], signals["url_has_date"], signals["img_count"], f"{int(round(signals['img_alt_pct']*100))}%", signals["video_like"]
+                    signals["url_has_year"], signals["url_has_date"], signals["img_count"], f"{int(round(signals['img_alt_pct']*100))}%", signals["video_like"],
+                    (f"{ux.get('perf_score'):.2f}" if ux.get("perf_score") is not None else "—"),
+                    ux.get("LCP_ms"), ux.get("CLS"), ux.get("INP_ms"),
+                    ux.get("fetch_time_ms"), ux.get("html_bytes"), ux.get("third_party_scripts"), ux.get("inline_scripts")
                 ],
             }))
             if signals["ld_types"]:
@@ -844,7 +1014,7 @@ if run:
             for r in recs: st.markdown(f"- {r}")
         else:
             st.info("Nice! No immediate gaps detected based on current heuristics.")
-        st.caption("Originality & AI-likeness are heuristic only (no external databases used).")
+        st.caption("CWV shown when available from PageSpeed Insights. Otherwise, a heuristic UX score is used.")
 
     with tab4:
         st.subheader("Debug / Raw")
@@ -853,11 +1023,7 @@ if run:
             "internal_links_sample": signals["p_internal_links"][:30],
             "external_links_sample": signals["p_external_links"][:30],
             "internal_anchor_texts_sample": signals["internal_anchor_texts"][:30],
-            "lead_score": round(signals["lead_score"],3),
-            "internal_anchor_quality": round(signals["internal_anchor_quality"],3),
-            "internal_semantic_score": round(signals["internal_semantic_score"],3),
-            "originality_score": round(signals["originality_score"],3),
-            "content_effort_score": round(signals["content_effort_score"],3),
+            "ux": signals["ux"],
             "stuffing_risk": round(signals["stuffing_risk"],3),
         })
 else:
