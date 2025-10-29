@@ -1,0 +1,6 @@
+streamlit>=1.36
+beautifulsoup4>=4.12
+requests>=2.31
+tldextract>=5.1
+python-dateutil>=2.9
+pandas>=2.2
