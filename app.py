@@ -464,7 +464,7 @@ async def _pyppeteer_render_aggressive(url: str, timeout=70, scroll_steps=14, wa
                         .map(el => el.innerText)
                         .filter(Boolean)
                         .join(' ');
-                    if ((text.split(/\s+/).filter(w=>w.length>2).length) < 200) return;
+                    if ((text.split(/\s+/).filter(w=>w.length>2).length) < 80) return;
                     const vis = document.createElement('div');
                     vis.setAttribute('data-visible-text', '1');
                     vis.textContent = text;
@@ -561,10 +561,26 @@ def extract_ldjson(soup: BeautifulSoup):
     return blobs
 
 def extract_main_content(soup: BeautifulSoup):
-    candidates = soup.find_all(["article", "main"])
+    # Prefer content injected during JS rendering
+    special = soup.select("[data-readability='1'], [data-visible-text='1'], [data-ss-iframe-article='1']")
+    if special:
+        container = soup.new_tag("div")
+        for node in special:
+            container.append(node)
+        return container
+    # Otherwise, pick the best large text container that's not nav-like
+    candidates = soup.find_all(["article", "main", "div", "section"])
+    def score_node(node):
+        txt_len = len(node.get_text(" ", strip=True))
+        cls = " ".join(node.get("class") or [])
+        pid = node.get("id") or ""
+        if NAV_LIKE.search(cls) or NAV_LIKE.search(pid):
+            return -1
+        return txt_len
     if candidates:
-        best = max(candidates, key=lambda c: len(c.get_text(" ", strip=True)))
-        return best
+        best = max(candidates, key=score_node)
+        if score_node(best) > 0:
+            return best
     body = soup.body or soup
     # strip obvious nav/footer/aside
     for tag in body.find_all(["nav","footer","aside"]):
@@ -808,6 +824,11 @@ def analyze_url(url: str, use_js=False, exclude_toc=True, require_nonempty_ancho
     main = extract_main_content(soup)
     text_blocks = extract_text_blocks(main)
     full_text = clean_text(" ".join(text_blocks))
+    # Fallback: if structured blocks were sparse, use entire body text
+    if len(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", full_text)) < 80:
+        body_all = clean_text((soup.body.get_text(" ", strip=True) if soup.body else ""))
+        if len(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", body_all)) > len(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", full_text)):
+            full_text = body_all
     word_count = len(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", full_text))
     reading_ease = flesch_reading_ease(full_text)
 
@@ -1501,3 +1522,4 @@ if run:
         })
 else:
     st.info("Enter a URL + optional target keywords in the sidebar and click **Run Analysis**.")
+
