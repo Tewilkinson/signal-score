@@ -590,4 +590,210 @@ def score_page(s: dict):
     per = 1.0 if s.get("person_schema") else 0.0
     jsonld = 1.0 if s.get("jsonld_present") else 0.0
     if org==0.0: recs.append("Add Organization schema (name, logo, sameAs).")
-    if per==0.0: recs.append("Add Person schema for the
+    if per==0.0: recs.append("Add Person schema for the author.")
+    if jsonld==0.0: recs.append("Add Article/BlogPosting JSON-LD with author & dates.")
+    pts += org * weights["org_schema"]
+    pts += per * weights["person_schema"]
+    pts += jsonld * weights["jsonld"]
+
+    # About/Contact via link heuristic (use internal links as proxy)
+    about_contact = any(any(x in u.lower() for x in ["/about","/contact","/impressum","/company"]) for u in s.get("p_internal_links",[]))
+    ac = 1.0 if about_contact else 0.0
+    if ac==0.0: recs.append("Link prominently to About/Contact to improve trust.")
+    pts += ac * weights["about_contact"]
+
+    # Citations (ties to externals)
+    citations = 1.0 if extern>0 else 0.0
+    pts += citations * weights["citations"]
+
+    # Freshness & canonical
+    mp = s.get("months_since_pub", math.inf)
+    if mp <= 6: fp=1.0
+    elif mp <= 18: fp=0.8
+    elif mp <= 24: fp=0.6
+    else:
+        fp=0.2; recs.append("Refresh old content or add a clear ‘last updated’ if materially revised.")
+    pts += fp * weights["fresh_pub"]
+
+    mm = s.get("months_since_mod", math.inf)
+    if mm <= 3: fm=1.0
+    elif mm <= 12: fm=0.8
+    elif math.isfinite(mm): fm=0.4
+    else:
+        fm=0.2; recs.append("Make a meaningful update and surface the modified date.")
+    pts += fm * weights["fresh_mod"]
+
+    canonical_ok = 1.0 if (s.get("canonical") and not s.get("canonical_offsite")) else 0.6 if s.get("canonical") else 0.8
+    if not s.get("canonical"): recs.append("Declare a canonical URL.")
+    if s.get("canonical_offsite"): recs.append("Canonical points off-site — verify this is intended.")
+    pts += canonical_ok * weights["canonical_ok"]
+
+    # Quality/safety
+    viewport = 1.0 if s.get("viewport_ok") else 0.6
+    if viewport<1.0: recs.append("Add responsive meta viewport.")
+    pts += viewport * weights["viewport"]
+
+    noindex = 1.0 if not s.get("robots_noindex") else 0.0
+    if noindex==0.0: recs.append("Remove noindex if you want this page to rank.")
+    pts += noindex * weights["noindex"]
+
+    stuffing = 1.0 - min(1.0, s.get("stuffing_risk",0.0))
+    if s.get("stuffing_risk",0.0) >= 0.5: recs.append("Reduce repeated keyword usage; vary phrasing and add unique value.")
+    pts += stuffing * weights["stuffing_penalty"]
+
+    orig = s.get("originality_score",0.0)
+    pts += orig * weights["originality"]
+    if orig < 0.6: recs.append("Increase originality: add unique data, examples, quotes; avoid stock phrasing.")
+
+    effort = s.get("content_effort_score",0.0)
+    pts += effort * weights["content_effort"]
+    if effort < 0.6: recs.append("Increase content effort: add images (with alts), embed video, include schema & clear authorship.")
+
+    score_100 = round(pts / max_points * 100, 1)
+
+    breakdown = pd.DataFrame([
+        ("Title / Intent", round(title_ok*weights["title_match"],2), weights["title_match"]),
+        ("Heading Structure", round(h_ok*weights["h_structure"],2), weights["h_structure"]),
+        ("Content Depth", round(depth*weights["content_depth"],2), weights["content_depth"]),
+        ("Readability", round(rscore*weights["readability"],2), weights["readability"]),
+        ("Evergreen URL", round(evergreen*weights["url_evergreen"],2), weights["url_evergreen"]),
+        ("Lead Priority", round(lead*weights["lead_priority"],2), weights["lead_priority"]),
+        ("Internal Links (p)", round(il*weights["internal_links"],2), weights["internal_links"]),
+        ("External Citations (p)", round(el*weights["external_links"],2), weights["external_links"]),
+        ("Image Alt Coverage", round(ia*weights["image_alts"],2), weights["image_alts"]),
+        ("Internal Anchor Quality", round(iaq*weights["internal_anchor_quality"],2), weights["internal_anchor_quality"]),
+        ("Internal Semantic Relatedness", round(isem*weights["internal_semantic"],2), weights["internal_semantic"]),
+        ("Author Attribution", round(ap*weights["author"],2), weights["author"]),
+        ("Org Schema", round(org*weights["org_schema"],2), weights["org_schema"]),
+        ("Person Schema", round(per*weights["person_schema"],2), weights["person_schema"]),
+        ("JSON-LD Present", round(jsonld*weights["jsonld"],2), weights["jsonld"]),
+        ("About/Contact Links", round(ac*weights["about_contact"],2), weights["about_contact"]),
+        ("Citations Present", round(citations*weights["citations"],2), weights["citations"]),
+        ("Freshness (Publish)", round(fp*weights["fresh_pub"],2), weights["fresh_pub"]),
+        ("Freshness (Modify)", round(fm*weights["fresh_mod"],2), weights["fresh_mod"]),
+        ("Canonical OK", round(canonical_ok*weights["canonical_ok"],2), weights["canonical_ok"]),
+        ("Viewport / Mobile", round(viewport*weights["viewport"],2), weights["viewport"]),
+        ("Indexable", round(noindex*weights["noindex"],2), weights["noindex"]),
+        ("No Stuffing", round(stuffing*weights["stuffing_penalty"],2), weights["stuffing_penalty"]),
+        ("Originality", round(orig*weights["originality"],2), weights["originality"]),
+        ("Content Effort", round(effort*weights["content_effort"],2), weights["content_effort"]),
+    ], columns=["Signal","Points Awarded","Max Points"])
+
+    # dedupe recs, cap at 12
+    seen=set(); uniq=[]
+    for r in recs:
+        if r not in seen:
+            uniq.append(r); seen.add(r)
+    return score_100, breakdown, uniq[:12]
+
+# -----------------------------
+# UI
+# -----------------------------
+st.title("📶 SignalScore Content")
+st.caption("Heuristic content quality, E-E-A-T, and on-page scoring (0–100) with transparent signals.")
+
+with st.sidebar:
+    st.header("Analyze a Page")
+    url = st.text_input("URL", placeholder="https://example.com/article")
+    js = st.checkbox("Enable JavaScript rendering (experimental)", value=False,
+                     help="Uses requests-html / Pyppeteer. May be slower or unavailable on some hosts. Falls back to basic fetch.")
+    ua = st.text_input("Custom User-Agent (optional)", value=HEADERS["User-Agent"])
+    run = st.button("Run Analysis", type="primary")
+    st.markdown("---")
+    st.caption("Links are evaluated **inside paragraphs only**. Internal semantic score uses URL slug context vs page terms.")
+
+if run:
+    if not url:
+        st.error("Please enter a URL."); st.stop()
+    with st.spinner("Fetching & analyzing…"):
+        try:
+            if ua and ua.strip():
+                HEADERS["User-Agent"] = ua.strip()
+            signals = analyze_url(url, use_js=js)
+            score, breakdown, recs = score_page(signals)
+        except requests.exceptions.RequestException as e:
+            st.error(f"Network error: {e}"); st.stop()
+        except Exception as e:
+            st.exception(e); st.stop()
+
+    st.success(f"SignalScore Content: **{score}/100**")
+
+    # KPI Row
+    c1,c2,c3,c4,c5 = st.columns(5)
+    with c1: st.metric("Words", f"{signals['word_count']:,}")
+    with c2: st.metric("Readability (FRE)", f"{signals['reading_ease']:.0f}")
+    with c3: st.metric("Internal Links (p)", str(len(signals["p_internal_links"])))
+    with c4: st.metric("External Links (p)", str(len(signals["p_external_links"])))
+    with c5: st.metric("Lead Score", f"{signals['lead_score']:.2f}")
+
+    tab1,tab2,tab3,tab4 = st.tabs(["Score Breakdown","Signals","Recommendations","Debug"])
+
+    with tab1:
+        st.subheader("Score Breakdown")
+        st.dataframe(breakdown, use_container_width=True, hide_index=True)
+        st.caption("Points Awarded vs Max Points (weights).")
+
+    with tab2:
+        st.subheader("Extracted Signals")
+        colA,colB = st.columns([2,1])
+        with colA:
+            st.markdown(f"**Title:** {signals['title'] or '—'}")
+            st.markdown(f"**Meta Description:** {signals['meta_desc'] or '—'}")
+            st.markdown(f"**H1:** {signals['h1'] or '—'}")
+            if signals["h2s"]:
+                st.markdown("**H2s:**")
+                st.write(pd.DataFrame({"H2": signals["h2s"]}))
+            st.markdown(f"**Author Present:** {signals['author_present']}")
+            if signals["author_names"]:
+                st.markdown("**Author Names:** " + ", ".join(signals["author_names"]))
+            pub = signals["published_dt"].isoformat() if signals["published_dt"] else "—"
+            mod = signals["modified_dt"].isoformat() if signals["modified_dt"] else "—"
+            st.markdown(f"**Published:** {pub}")
+            st.markdown(f"**Modified:** {mod}")
+            st.markdown(f"**Internal Anchor Quality:** {signals['internal_anchor_quality']:.2f}")
+            st.markdown(f"**Internal Semantic Score:** {signals['internal_semantic_score']:.2f}")
+            st.markdown(f"**Lead (Inverted Pyramid) Score:** {signals['lead_score']:.2f}")
+            st.markdown(f"**Originality Score (heuristic):** {signals['originality_score']:.2f}")
+            st.markdown(f"**Content Effort Score:** {signals['content_effort_score']:.2f}")
+        with colB:
+            st.markdown("**Technical / Meta**")
+            st.write(pd.DataFrame({
+                "Key":[
+                    "Viewport Meta","Canonical Present","Canonical Off-site",
+                    "Robots Noindex","JSON-LD Present","Org Schema","Person Schema",
+                    "URL Has Year","URL Has Date","Images (count)","Images w/ Alt %","Videos (embeds)"
+                ],
+                "Value":[
+                    signals["viewport_ok"], bool(signals["canonical"]), signals["canonical_offsite"],
+                    signals["robots_noindex"], signals["jsonld_present"], signals["org_schema"], signals["person_schema"],
+                    signals["url_has_year"], signals["url_has_date"], signals["img_count"], f"{int(round(signals['img_alt_pct']*100))}%", signals["video_like"]
+                ],
+            }))
+            if signals["ld_types"]:
+                st.markdown("**Detected schema.org @type:** " + ", ".join(signals["ld_types"]))
+
+    with tab3:
+        st.subheader("Top Recommendations")
+        if recs:
+            for r in recs: st.markdown(f"- {r}")
+        else:
+            st.info("Nice! No immediate gaps detected based on current heuristics.")
+        st.caption("Originality & AI-likeness are heuristic only (no external databases used).")
+
+    with tab4:
+        st.subheader("Debug / Raw")
+        st.json({
+            "url": url,
+            "p_internal_links": signals["p_internal_links"][:20],
+            "p_external_links": signals["p_external_links"][:20],
+            "lead_score": round(signals["lead_score"],3),
+            "internal_anchor_quality": round(signals["internal_anchor_quality"],3),
+            "internal_semantic_score": round(signals["internal_semantic_score"],3),
+            "originality_score": round(signals["originality_score"],3),
+            "content_effort_score": round(signals["content_effort_score"],3),
+            "stuffing_risk": round(signals["stuffing_risk"],3),
+        })
+else:
+    st.title("")
+    st.info("Enter a URL in the sidebar and click **Run Analysis**.")
+
