@@ -305,7 +305,7 @@ async def _pyppeteer_render(url: str, timeout=40, scroll_steps=8, wait_selectors
         except Exception:
             pass
 
-def render_with_pyppeteer(url: str, timeout=40, wait_selectors=None) -> str:
+def render_with_pyppeteer(url: str, timeout=40, wait_selectors=None, aggressive=False) -> str:
     if not PYPP_OK:
         raise RuntimeError("pyppeteer not installed")
     import asyncio
@@ -313,14 +313,105 @@ def render_with_pyppeteer(url: str, timeout=40, wait_selectors=None) -> str:
         loop = asyncio.get_event_loop()
         if loop.is_running():
             # With nest_asyncio applied above, we can safely run until complete
-            return loop.run_until_complete(_pyppeteer_render(url, timeout=timeout, scroll_steps=10, wait_selectors=wait_selectors))
+            return loop.run_until_complete(_pyppeteer_render_aggressive(url, timeout=timeout, scroll_steps=14, wait_selectors=wait_selectors) if aggressive else _pyppeteer_render(url, timeout=timeout, scroll_steps=10, wait_selectors=wait_selectors))
         else:
-            return loop.run_until_complete(_pyppeteer_render(url, timeout=timeout, scroll_steps=10, wait_selectors=wait_selectors))
+            return loop.run_until_complete(_pyppeteer_render_aggressive(url, timeout=timeout, scroll_steps=14, wait_selectors=wait_selectors) if aggressive else _pyppeteer_render(url, timeout=timeout, scroll_steps=10, wait_selectors=wait_selectors))
     except RuntimeError:
         # No current event loop; use asyncio.run
-        return asyncio.run(_pyppeteer_render(url, timeout=timeout, scroll_steps=10, wait_selectors=wait_selectors))
+        return asyncio.run(_pyppeteer_render_aggressive(url, timeout=timeout, scroll_steps=14, wait_selectors=wait_selectors) if aggressive else _pyppeteer_render(url, timeout=timeout, scroll_steps=10, wait_selectors=wait_selectors))
 
-def fetch_html(url: str, use_js: bool, wait_selectors: list[str] | None = None):
+
+# Aggressive renderer: stealth tweaks + content readiness waits + Readability injection
+async def _pyppeteer_render_aggressive(url: str, timeout=70, scroll_steps=14, wait_selectors=None) -> str:
+    if wait_selectors is None:
+        wait_selectors = [
+            "article", "main article", ".markdown-body", "[role='main']",
+            "[data-cmp-hook-richtext='text']", ".content", ".post-content", ".entry-content",
+        ]
+    browser = await launch(
+        headless=True,
+        args=[
+            "--no-sandbox","--disable-dev-shm-usage","--disable-gpu","--single-process",
+            "--disable-blink-features=AutomationControlled",
+        ]
+    )
+    try:
+        page = await browser.newPage()
+        await page.setUserAgent(HEADERS["User-Agent"]) 
+        await page.setExtraHTTPHeaders({
+            "Accept": HEADERS.get("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+            "Accept-Language": "en-US,en;q=0.9",
+            "Upgrade-Insecure-Requests": "1",
+            "DNT": "1",
+        })
+        # Minimal stealth: mask webdriver and basic fingerprints
+        await page.evaluateOnNewDocument("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => false});
+            window.chrome = { runtime: {} };
+            Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
+        """)
+        await page.setViewport({"width": 1440, "height": 1000, "deviceScaleFactor": 1})
+        await page.goto(url, {"waitUntil": "networkidle0", "timeout": timeout*1000})
+
+        # Try dismissing consent
+        try:
+            await page.evaluate("""
+                const btn = document.querySelector('#onetrust-accept-btn-handler, button#truste-consent-button');
+                if (btn) btn.click();
+            """)
+        except (Exception):
+            pass
+        await page.waitForTimeout(1000)
+
+        # Deep scroll to load lazy content
+        for _ in range(scroll_steps):
+            await page.evaluate("window.scrollBy(0, document.body.scrollHeight / 5);")
+            await page.waitForTimeout(700)
+
+        # Wait for selectors or for body to contain enough words
+        ready = False
+        for sel in wait_selectors:
+            try:
+                await page.waitForSelector(sel, {"timeout": 5000, "visible": True})
+                ready = True
+                break
+            except Exception:
+                continue
+        if not ready:
+            try:
+                await page.waitForFunction("document.body && document.body.innerText.split(/\s+/).filter(w=>w.length>3).length > 200", {"timeout": 6000})
+                ready = True
+            except Exception:
+                pass
+
+        # Inject Readability to extract article content
+        try:
+            await page.addScriptTag({"url": "https://cdn.jsdelivr.net/npm/@mozilla/readability@0.4.4/Readability.js"})
+            await page.evaluate("""
+                try {
+                    const article = new Readability(document).parse();
+                    if (article && (article.textContent || '').split(/\s+/).length > 120) {
+                        const wrap = document.createElement('div');
+                        wrap.setAttribute('data-readability', '1');
+                        wrap.innerHTML = `<h1>${article.title || ''}</h1>` + (article.content || '');
+                        document.body.appendChild(wrap);
+                    }
+                } catch(e) {}
+            """)
+        except Exception:
+            pass
+
+        # Small idle wait
+        await page.waitForTimeout(1200)
+        return await page.content()
+    finally:
+        try:
+            await browser.close()
+        except Exception:
+            pass
+
+def fetch_html(url: str, use_js: bool, wait_selectors: list[str] | None = None, aggressive=False):
     """
     Returns (html_text, fetch_ms, html_bytes, did_js, renderer)
     Auto-upgrades to JS render if first pass looks like CSR shell (tiny body / no content).
@@ -372,7 +463,7 @@ def fetch_html(url: str, use_js: bool, wait_selectors: list[str] | None = None):
                 did_js = True
                 renderer = "pyppeteer"
                 t2 = _t.time()
-                html_text = render_with_pyppeteer(url, timeout=55, wait_selectors=wait_selectors)
+                html_text = render_with_pyppeteer(url, timeout=65, wait_selectors=wait_selectors, aggressive=aggressive)
                 fetch_ms, html_bytes = _measure(html_text, t2)
             except Exception:
                 # keep whatever we have
@@ -581,7 +672,7 @@ def compute_keyword_relevance(full_text: str, h1: str, h2s: list[str], keywords_
 # -----------------------------
 # Extraction & Analysis
 # -----------------------------
-def analyze_url(url: str, use_js=False, exclude_toc=True, require_nonempty_anchor=True, want_psi=False, psi_key=None, keywords_raw:str="", wait_selector_input: str | None = None):
+def analyze_url(url: str, use_js=False, exclude_toc=True, require_nonempty_anchor=True, want_psi=False, psi_key=None, keywords_raw:str="", wait_selector_input: str | None = None, aggressive=False):
     wait_selectors = None
     if wait_selector_input and wait_selector_input.strip():
         # Support comma/line separated selectors
@@ -595,7 +686,7 @@ def analyze_url(url: str, use_js=False, exclude_toc=True, require_nonempty_ancho
             "main [class*='content']",
             "main [data-component]",
         ]
-    html_text, fetch_ms, html_bytes, did_js, renderer = fetch_html(url, use_js, wait_selectors=wait_selectors)
+    html_text, fetch_ms, html_bytes, did_js, renderer = fetch_html(url, use_js, wait_selectors=wait_selectors, aggressive=aggressive)
     soup = BeautifulSoup(html_text, "html.parser")
 
     # If content still looks empty, try <noscript> fallback
@@ -1169,6 +1260,8 @@ with st.sidebar:
 
     js = st.checkbox("Enable JavaScript rendering (manual boost)", value=False,
                      help="The app auto-detects CSR pages and renders JS anyway. Enable to force JS render early.")
+    aggressive = st.checkbox("Aggressive rendering (stealth + Readability)", value=True,
+                             help="Use anti-bot tweaks, longer waits, and Readability extraction for hard pages.")
     wait_selector = st.text_input("Wait for selector (optional)",
                                   help="CSS selector(s), comma or line separated, to wait for before snapshot. Example: main article, .markdown-body")
 
@@ -1196,7 +1289,8 @@ if run:
                 want_psi=want_psi_switch,
                 psi_key=(psi_key_manual or None),
                 keywords_raw=keywords_input or "",
-                wait_selector_input=wait_selector or None
+                wait_selector_input=wait_selector or None,
+                aggressive=aggressive
             )
             score, cat_df, breakdown, recs = score_page(signals)
         except requests.exceptions.RequestException as e:
