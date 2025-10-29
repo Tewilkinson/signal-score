@@ -57,12 +57,20 @@ AUTHOR_META_KEYS = [
     ("div", {"class": re.compile(r"author", re.I)}),
 ]
 
-NAV_LIKE = re.compile(r"(nav|menu|breadcrumb|footer|subscribe|cookie|banner|sidebar|aside|comment|share)", re.I)
+# Expanded nav-like detector
+NAV_LIKE = re.compile(
+    r"(nav|menu|breadcrumb|footer|header|toc|table-of-contents|sidebar|aside|"
+    r"pagination|pager|next-prev|share|social|subscribe|cookie|banner|"
+    r"newsletter|promo|advert|ad-)",
+    re.I
+)
+
 YEAR_IN_URL = re.compile(r"/(19|20)\d{2}(/|-)", re.I)
 DATE_IN_URL = re.compile(r"/(19|20)\d{2}/(0?[1-9]|1[0-2])/", re.I)
 
 GENERIC_ANCHORS = {
-    "click here","read more","learn more","here","this","link","more","see more","details","visit","check this"
+    "click here","read more","learn more","here","this","link","more",
+    "see more","details","visit","check this","go","find out more"
 }
 
 STOPWORDS = set("""
@@ -120,7 +128,7 @@ def estimate_syllables(word: str) -> int:
     w = re.sub(r"[^a-zà-öø-ÿ]", "", word.lower())
     if not w:
         return 0
-    groups = re.findall(r"[aeiouyà-äæè-ëì-ïò-öøù-ü]+", w)
+    groups = re.findall(r"[aeiouyà-äæè-ëì-ïò-öø-ü]+", w)
     count = max(1, len(groups))
     if w.endswith("e") and count > 1:
         count -= 1
@@ -150,7 +158,6 @@ def token_set_from_text(text: str):
 def token_set_from_url_path(url: str):
     parsed = urllib.parse.urlparse(url)
     path = parsed.path.lower()
-    # split by / - _ . and remove stopwords, numbers
     parts = re.split(r"[\/\-\_\.\+]+", path)
     parts = [p for p in parts if p and not re.match(r"^\d+$", p) and p not in STOPWORDS]
     return set(parts)
@@ -172,7 +179,7 @@ def render_with_js(url: str, timeout=ABS_TIMEOUT) -> str:
         raise RuntimeError("requests-html not installed")
     s = HTMLSession()
     r = s.get(url, headers=HEADERS, timeout=timeout)
-    # Render JS (pyppeteer). This may fail on some hosts; we catch upstream.
+    # Render JS (pyppeteer). May fail on some hosts; fallback handled upstream.
     r.html.render(timeout=timeout*1000, sleep=1)
     return r.html.html
 
@@ -181,8 +188,7 @@ def fetch_html(url: str, use_js: bool) -> str:
         try:
             return render_with_js(url)
         except Exception:
-            # Fallback to non-JS fetch
-            pass
+            pass  # fallback to non-JS fetch
     r = requests.get(url, headers=HEADERS, timeout=ABS_TIMEOUT)
     r.raise_for_status()
     return r.text
@@ -208,18 +214,42 @@ def extract_main_content(soup: BeautifulSoup):
     # Prefer <article>, then <main>, fallback to body stripped
     candidates = soup.find_all(["article", "main"])
     if candidates:
-        # choose the longest
         best = max(candidates, key=lambda c: len(c.get_text(" ", strip=True)))
         return best
     body = soup.body or soup
     # strip obvious nav/footer/aside
-    for tag in body.find_all(["nav","footer","aside"]):
+    for tag in body.find_all(["nav","footer","aside","header"]):
         tag.extract()
     for tag in body.find_all(True, class_=NAV_LIKE):
         tag.extract()
     for c in body.find_all(string=lambda t: isinstance(t, Comment)):
         c.extract()
     return body
+
+def is_in_navigation_context(tag) -> bool:
+    """Skip links inside nav/header/footer/aside or elements with nav-like classes/ids."""
+    for parent in tag.parents:
+        name = getattr(parent, "name", None)
+        if name in {"nav", "footer", "header", "aside"}:
+            return True
+        cls = " ".join(parent.get("class") or [])
+        pid = parent.get("id") or ""
+        if NAV_LIKE.search(cls) or NAV_LIKE.search(pid):
+            return True
+    return False
+
+def visible_anchor_text(a):
+    """Prefer visible text; fallback to title/aria-label or <img alt>."""
+    txt = clean_text(a.get_text(" ", strip=True))
+    if txt:
+        return txt
+    txt = clean_text(a.get("title") or a.get("aria-label") or "")
+    if txt:
+        return txt
+    img = a.find("img")
+    if img and img.get("alt"):
+        return clean_text(img.get("alt"))
+    return ""
 
 def extract_text_blocks(node):
     texts = []
@@ -232,7 +262,7 @@ def extract_text_blocks(node):
 # -----------------------------
 # Extraction & Analysis
 # -----------------------------
-def analyze_url(url: str, use_js=False):
+def analyze_url(url: str, use_js=False, exclude_toc=True, require_nonempty_anchor=False):
     html_text = fetch_html(url, use_js)
     soup = BeautifulSoup(html_text, "html.parser")
 
@@ -270,21 +300,38 @@ def analyze_url(url: str, use_js=False):
     word_count = len(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", full_text))
     reading_ease = flesch_reading_ease(full_text)
 
-    # ----- Links: ONLY inside <p> tags in main -----
+    # ----- Links: ANY in-content <a> in main, skip nav/header/footer/aside & nav-like wrappers -----
     internal_links, external_links, internal_anchor_texts = [], [], []
-    p_tags = main.find_all("p")
-    for p in p_tags:
-        for a in p.find_all("a", href=True):
-            href = absolute_url(a["href"], url)
-            txt = clean_text(a.get_text(" ", strip=True)).lower()
-            if is_internal(href, base_domain):
-                internal_links.append(href)
-                internal_anchor_texts.append(txt)
-            else:
-                external_links.append(href)
 
-    # ----- Internal anchor text quality score -----
-    # descriptive if >= 3 words OR contains non-generic tokens
+    for a in main.find_all("a", href=True):
+        if is_in_navigation_context(a):
+            continue  # ignore nav/footer/etc.
+
+        href = absolute_url(a["href"], url)
+        txt = visible_anchor_text(a).lower()
+
+        # Optional TOC exclusion: href starting with # or toc-like ancestors
+        if exclude_toc:
+            if href.endswith("#") or urllib.parse.urlparse(href).fragment:
+                # #fragment links
+                continue
+            # Also skip if a parent looks like a ToC
+            parent_str = " ".join((a.get("class") or [])) + " " + (a.get("id") or "")
+            for p in a.parents:
+                parent_str += " " + " ".join(p.get("class") or []) + " " + (p.get("id") or "")
+            if re.search(r"(toc|table-of-contents|jump\-links|page\-contents)", parent_str, re.I):
+                continue
+
+        if require_nonempty_anchor and not txt:
+            continue  # skip if no meaningful anchor text even after fallbacks
+
+        if is_internal(href, base_domain):
+            internal_links.append(href)
+            internal_anchor_texts.append(txt)
+        else:
+            external_links.append(href)
+
+    # ----- Internal anchor text quality -----
     descriptive = 0
     for txt in internal_anchor_texts:
         words = [w for w in re.findall(r"[a-zA-ZÀ-ÖØ-öø-ÿ]+", txt) if w not in STOPWORDS]
@@ -309,7 +356,6 @@ def analyze_url(url: str, use_js=False):
         overlap = page_term_set.intersection(slug_terms)
         union = page_term_set.union(slug_terms)
         jacc = len(overlap) / max(1, len(union))
-        # Also reward if any top term appears in slug
         bonus = 0.15 if overlap else 0.0
         sims.append(min(1.0, jacc*1.5 + bonus))
     internal_semantic_score = sum(sims)/len(sims) if sims else 0.0
@@ -319,12 +365,10 @@ def analyze_url(url: str, use_js=False):
     rest_words = " ".join(full_text.split()[150:])
     lead_terms = set(t for t,_ in top_terms(first_words, n=20))
     all_terms = set(t for t,_ in top_terms(full_text, n=40))
-    # coverage of top overall terms inside the lead
     if all_terms:
         coverage = len(lead_terms.intersection(all_terms)) / len(all_terms)
     else:
         coverage = 0.0
-    # density: compare lead top-term count vs rest
     lead_cnt = sum(1 for t in re.findall(r"[a-zA-ZÀ-ÖØ-öø-ÿ]{3,}", first_words.lower()) if t in all_terms)
     rest_cnt = sum(1 for t in re.findall(r"[a-zA-ZÀ-ÖØ-öø-ÿ]{3,}", rest_words.lower()) if t in all_terms) or 1
     density_ratio = (lead_cnt / max(1, len(first_words.split()))) / (rest_cnt / max(1, len(rest_words.split())))
@@ -373,6 +417,7 @@ def analyze_url(url: str, use_js=False):
                     dt = try_parse_date(txt)
                     if dt: return dt
         return None
+
     published_dt = find_first_date(DATE_META_KEYS)
     modified_dt = find_first_date(MODIFIED_META_KEYS)
 
@@ -401,15 +446,13 @@ def analyze_url(url: str, use_js=False):
     url_has_date = bool(re.search(DATE_IN_URL, url))
 
     # ----- Heuristic originality / AI-ish proxies (free) -----
-    # Metrics: type-token ratio, bigram diversity, repetition (top-term dominance), sentence length variance, AI-ish phrases
     tokens = [t.lower() for t in re.findall(r"[a-zA-ZÀ-ÖØ-öø-ÿ]{3,}", full_text)]
     uniq = len(set(tokens)); total = len(tokens) or 1
-    ttr = uniq / total  # higher → more diverse
+    ttr = uniq / total
     bigrams = list(zip(tokens, tokens[1:])) if len(tokens) > 1 else []
     bigram_div = len(set(bigrams))/max(1,len(bigrams))
     cnt = Counter(tokens)
     top_ratio = cnt.most_common(1)[0][1]/total if total>0 else 0.0
-    # sentence burstiness
     sents = [s.strip() for s in re.split(r"[.!?]+", full_text) if s.strip()]
     sent_lengths = [len(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", s)) for s in sents] or [0]
     import statistics as stats
@@ -422,16 +465,14 @@ def analyze_url(url: str, use_js=False):
         "this comprehensive guide","utilize","it is important to note that"
     ]
     ai_hits = sum(1 for p in ai_phrases if p in full_text.lower())
-    # Compose originality 0..1
     diversity = 0.35*min(1.0, ttr*3) + 0.25*min(1.0, bigram_div*4) + 0.25*min(1.0, burst) + 0.15*(1.0-max(0.0,(top_ratio-0.03)/0.12))
     ai_penalty = min(0.25, ai_hits*0.07)
     originality_score = max(0.0, min(1.0, diversity - ai_penalty))
 
-    # ----- Content Effort score (videos, images, length, schema, author) -----
-    # Normalize with soft caps
-    norm_len = min(1.0, word_count/1800)          # 1.0 at ~1800 words
-    norm_img = min(1.0, img_count/6)              # 1.0 at 6 images
-    norm_vid = min(1.0, video_like/2)             # 1.0 at 2 videos
+    # ----- Content Effort score -----
+    norm_len = min(1.0, word_count/1800)
+    norm_img = min(1.0, img_count/6)
+    norm_vid = min(1.0, video_like/2)
     norm_schema = 1.0 if jsonld_present else 0.0
     norm_author = 1.0 if author_present else 0.0
     content_effort_score = 0.35*norm_len + 0.2*norm_img + 0.15*norm_vid + 0.15*norm_schema + 0.15*norm_author
@@ -448,6 +489,7 @@ def analyze_url(url: str, use_js=False):
         "title": title, "meta_desc": meta_desc, "h1": h1, "h2s": h2s,
         "word_count": word_count, "reading_ease": reading_ease,
         "p_internal_links": internal_links, "p_external_links": external_links,
+        "internal_anchor_texts": internal_anchor_texts,
         "internal_anchor_quality": internal_anchor_quality,
         "internal_semantic_score": internal_semantic_score,
         "lead_score": lead_score,
@@ -469,7 +511,7 @@ def analyze_url(url: str, use_js=False):
 # -----------------------------
 def score_page(s: dict):
     weights = {
-        # On-page (incl. your new lead score) — 35
+        # On-page (incl. lead score) — 35
         "title_match": 6,
         "h_structure": 5,
         "content_depth": 8,
@@ -477,7 +519,7 @@ def score_page(s: dict):
         "url_evergreen": 3,
         "lead_priority": 9,
 
-        # Links in body only — 20
+        # Links in content — 20
         "internal_links": 5,
         "external_links": 4,
         "image_alts": 4,
@@ -490,7 +532,7 @@ def score_page(s: dict):
         "person_schema": 2,
         "jsonld": 3,
         "about_contact": 2,
-        "citations": 5,  # ties to externals, but separate weight
+        "citations": 5,
 
         # Freshness / canonical — 12
         "fresh_pub": 4,
@@ -544,25 +586,25 @@ def score_page(s: dict):
     if evergreen < 1.0: recs.append("Prefer evergreen URLs (avoid embedding years/dates in path).")
     pts += evergreen * weights["url_evergreen"]
 
-    # NEW: Lead priority
+    # Lead priority
     lead = s.get("lead_score",0.0)
     pts += lead * weights["lead_priority"]
-    if lead < 0.6: recs.append("Open with the most important info: summarize key entities, numbers, and answers in the first ~150 words.")
+    if lead < 0.6: recs.append("Open with the most important info in the first ~150 words (entities, numbers, answers).")
 
-    # Links/media (p-only)
+    # Links/media (content-only)
     intern = len(s.get("p_internal_links",[]))
     extern = len(s.get("p_external_links",[]))
     if intern == 0:
-        il=0.0; recs.append("Add contextual internal links inside body copy (aim 3–15).")
+        il=0.0; recs.append("Add contextual internal links inside content (aim 3–15).")
     elif intern < 3:
-        il=0.6; recs.append("Add a few more internal links in paragraphs.")
+        il=0.6; recs.append("Add a few more internal links in the main content.")
     elif intern <= 20:
         il=1.0
     else: il=0.9
     pts += il * weights["internal_links"]
 
     if extern == 0:
-        el=0.0; recs.append("Cite reputable external sources (1–10) inside body copy.")
+        el=0.0; recs.append("Cite reputable external sources (1–10) inside the content.")
     elif extern <= 10:
         el=1.0
     else: el=0.8
@@ -579,7 +621,7 @@ def score_page(s: dict):
 
     isem = s.get("internal_semantic_score",0.0)
     pts += isem * weights["internal_semantic"]
-    if isem < 0.6: recs.append("Link to semantically related internal URLs (match slugs to the page’s key entities/topics).")
+    if isem < 0.6: recs.append("Link to semantically related internal URLs (align slugs with page key entities/topics).")
 
     # E-E-A-T proxies
     ap = 1.0 if s.get("author_present") else 0.0
@@ -596,13 +638,11 @@ def score_page(s: dict):
     pts += per * weights["person_schema"]
     pts += jsonld * weights["jsonld"]
 
-    # About/Contact via link heuristic (use internal links as proxy)
     about_contact = any(any(x in u.lower() for x in ["/about","/contact","/impressum","/company"]) for u in s.get("p_internal_links",[]))
     ac = 1.0 if about_contact else 0.0
     if ac==0.0: recs.append("Link prominently to About/Contact to improve trust.")
     pts += ac * weights["about_contact"]
 
-    # Citations (ties to externals)
     citations = 1.0 if extern>0 else 0.0
     pts += citations * weights["citations"]
 
@@ -658,8 +698,8 @@ def score_page(s: dict):
         ("Readability", round(rscore*weights["readability"],2), weights["readability"]),
         ("Evergreen URL", round(evergreen*weights["url_evergreen"],2), weights["url_evergreen"]),
         ("Lead Priority", round(lead*weights["lead_priority"],2), weights["lead_priority"]),
-        ("Internal Links (p)", round(il*weights["internal_links"],2), weights["internal_links"]),
-        ("External Citations (p)", round(el*weights["external_links"],2), weights["external_links"]),
+        ("Internal Links (content)", round(il*weights["internal_links"],2), weights["internal_links"]),
+        ("External Citations (content)", round(el*weights["external_links"],2), weights["external_links"]),
         ("Image Alt Coverage", round(ia*weights["image_alts"],2), weights["image_alts"]),
         ("Internal Anchor Quality", round(iaq*weights["internal_anchor_quality"],2), weights["internal_anchor_quality"]),
         ("Internal Semantic Relatedness", round(isem*weights["internal_semantic"],2), weights["internal_semantic"]),
@@ -697,10 +737,14 @@ with st.sidebar:
     url = st.text_input("URL", placeholder="https://example.com/article")
     js = st.checkbox("Enable JavaScript rendering (experimental)", value=False,
                      help="Uses requests-html / Pyppeteer. May be slower or unavailable on some hosts. Falls back to basic fetch.")
+    exclude_toc = st.checkbox("Exclude Table of Contents links", value=True,
+                              help="Skips #fragment links and links inside toc/table-of-contents wrappers.")
+    require_nonempty_anchor = st.checkbox("Require non-empty anchor text", value=False,
+                              help="Ignore links with no visible/title/aria/img-alt text.")
     ua = st.text_input("Custom User-Agent (optional)", value=HEADERS["User-Agent"])
     run = st.button("Run Analysis", type="primary")
     st.markdown("---")
-    st.caption("Links are evaluated **inside paragraphs only**. Internal semantic score uses URL slug context vs page terms.")
+    st.caption("Counts in-content links in <main>/<article>/<body>, excluding nav/header/footer/aside & nav-like wrappers.")
 
 if run:
     if not url:
@@ -709,7 +753,7 @@ if run:
         try:
             if ua and ua.strip():
                 HEADERS["User-Agent"] = ua.strip()
-            signals = analyze_url(url, use_js=js)
+            signals = analyze_url(url, use_js=js, exclude_toc=exclude_toc, require_nonempty_anchor=require_nonempty_anchor)
             score, breakdown, recs = score_page(signals)
         except requests.exceptions.RequestException as e:
             st.error(f"Network error: {e}"); st.stop()
@@ -722,8 +766,8 @@ if run:
     c1,c2,c3,c4,c5 = st.columns(5)
     with c1: st.metric("Words", f"{signals['word_count']:,}")
     with c2: st.metric("Readability (FRE)", f"{signals['reading_ease']:.0f}")
-    with c3: st.metric("Internal Links (p)", str(len(signals["p_internal_links"])))
-    with c4: st.metric("External Links (p)", str(len(signals["p_external_links"])))
+    with c3: st.metric("Internal Links (content)", str(len(signals["p_internal_links"])))
+    with c4: st.metric("External Links (content)", str(len(signals["p_external_links"])))
     with c5: st.metric("Lead Score", f"{signals['lead_score']:.2f}")
 
     tab1,tab2,tab3,tab4 = st.tabs(["Score Breakdown","Signals","Recommendations","Debug"])
@@ -784,8 +828,9 @@ if run:
         st.subheader("Debug / Raw")
         st.json({
             "url": url,
-            "p_internal_links": signals["p_internal_links"][:20],
-            "p_external_links": signals["p_external_links"][:20],
+            "internal_links_sample": signals["p_internal_links"][:20],
+            "external_links_sample": signals["p_external_links"][:20],
+            "internal_anchor_texts_sample": signals["internal_anchor_texts"][:20],
             "lead_score": round(signals["lead_score"],3),
             "internal_anchor_quality": round(signals["internal_anchor_quality"],3),
             "internal_semantic_score": round(signals["internal_semantic_score"],3),
@@ -796,4 +841,3 @@ if run:
 else:
     st.title("")
     st.info("Enter a URL in the sidebar and click **Run Analysis**.")
-
