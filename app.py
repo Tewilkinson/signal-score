@@ -402,6 +402,77 @@ async def _pyppeteer_render_aggressive(url: str, timeout=70, scroll_steps=14, wa
         except Exception:
             pass
 
+        # Flatten shadow DOM into the document to aid HTML serialization
+        try:
+            await page.evaluate("""
+                (function flattenShadows(root) {
+                    const hosts = root.querySelectorAll('*');
+                    hosts.forEach(h => {
+                        if (h.shadowRoot) {
+                            const clone = document.createElement('div');
+                            clone.setAttribute('data-shadow-host', '1');
+                            clone.innerHTML = h.shadowRoot.innerHTML;
+                            h.appendChild(clone);
+                            flattenShadows(h.shadowRoot);
+                        }
+                    });
+                })(document);
+            """)
+        except Exception {}
+
+        # Attempt to harvest same-origin iframes content using Readability and append stubs
+        try:
+            for frame in page.frames:
+                try:
+                    # Skip cross-origin frames (will throw on evaluation)
+                    await frame.evaluate("document.body && 1")
+                except Exception:
+                    continue
+                try:
+                    await frame.addScriptTag({"url": "https://cdn.jsdelivr.net/npm/@mozilla/readability@0.4.4/Readability.js"})
+                except Exception:
+                    pass
+                try:
+                    await frame.evaluate("""
+                        try {
+                            if (typeof Readability === 'function') {
+                                const art = new Readability(document).parse();
+                                if (art && (art.textContent||'').split(/\s+/).length > 100) {
+                                    const mount = document.createElement('div');
+                                    mount.setAttribute('data-ss-iframe-article', '1');
+                                    mount.innerHTML = `<h2>${art.title || ''}</h2>` + (art.content || '');
+                                    document.body.appendChild(mount);
+                                }
+                            }
+                        } catch(e) {}
+                    """)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # If still looks empty by word-count, append a visible text snapshot
+        try:
+            await page.evaluate("""
+                try {
+                    const text = Array.from(document.querySelectorAll('body *'))
+                        .filter(el => {
+                            const style = window.getComputedStyle(el);
+                            return style && style.display !== 'none' && style.visibility !== 'hidden';
+                        })
+                        .map(el => el.innerText)
+                        .filter(Boolean)
+                        .join(' ');
+                    if ((text.split(/\s+/).filter(w=>w.length>2).length) < 200) return;
+                    const vis = document.createElement('div');
+                    vis.setAttribute('data-visible-text', '1');
+                    vis.textContent = text;
+                    document.body.appendChild(vis);
+                } catch(e) {}
+            """)
+        except Exception:
+            pass
+
         # Small idle wait
         await page.waitForTimeout(1200)
         return await page.content()
