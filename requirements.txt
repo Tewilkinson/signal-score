@@ -8,5 +8,5 @@ requests-html>=0.10.0
 pyppeteer>=1.0
 openai>=1.30.0
 pandas>=2.2
-
+nest-asyncio
 
