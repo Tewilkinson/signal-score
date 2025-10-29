@@ -458,5 +458,136 @@ def analyze_url(url: str, use_js=False):
         "url_has_year": url_has_year, "url_has_date": url_has_date,
         "viewport_ok": viewport_ok, "canonical": canonical, "canonical_offsite": canonical_offsite,
         "robots_noindex": robots_noindex, "jsonld_present": jsonld_present,
-        "ld_types": sorted(ld_types), "org
+        "ld_types": sorted(ld_types), "org_schema": org_schema, "person_schema": person_schema,
+        "stuffing_risk": stuffing_risk,
+        "originality_score": originality_score,
+        "content_effort_score": content_effort_score,
+    }
 
+# -----------------------------
+# Scoring Model (0..100)
+# -----------------------------
+def score_page(s: dict):
+    weights = {
+        # On-page (incl. your new lead score) — 35
+        "title_match": 6,
+        "h_structure": 5,
+        "content_depth": 8,
+        "readability": 4,
+        "url_evergreen": 3,
+        "lead_priority": 9,
+
+        # Links in body only — 20
+        "internal_links": 5,
+        "external_links": 4,
+        "image_alts": 4,
+        "internal_anchor_quality": 3,
+        "internal_semantic": 4,
+
+        # E-E-A-T proxies — 20
+        "author": 5,
+        "org_schema": 3,
+        "person_schema": 2,
+        "jsonld": 3,
+        "about_contact": 2,
+        "citations": 5,  # ties to externals, but separate weight
+
+        # Freshness / canonical — 12
+        "fresh_pub": 4,
+        "fresh_mod": 4,
+        "canonical_ok": 4,
+
+        # Quality & safety — 13
+        "viewport": 3,
+        "noindex": 3,
+        "stuffing_penalty": 3,
+        "originality": 2,
+        "content_effort": 2,
+    }
+    max_points = sum(weights.values())
+    pts = 0.0
+    recs = []
+
+    title = s.get("title",""); h1 = s.get("h1","")
+    title_ok = 0.0
+    if 25 <= len(title) <= 70: title_ok += 0.6
+    if h1 and title and (h1.lower() in title.lower() or title.lower() in h1.lower()): title_ok += 0.4
+    pts += title_ok * weights["title_match"]
+    if title_ok < 1.0: recs.append("Tighten <title> to 25–70 chars and align strongly with H1 / search intent.")
+
+    h2s = s.get("h2s") or []
+    h_ok = 1.0 if (h1 and len(h2s) >= 2) else 0.5 if (h1 or len(h2s)>=1) else 0.0
+    pts += h_ok * weights["h_structure"]
+    if h_ok < 1.0: recs.append("Use a clear heading hierarchy: one H1 and 2–6 H2s covering subtopics.")
+
+    wc = s.get("word_count",0)
+    if wc <= 300:
+        depth = 0.2; recs.append("Add more substance: target ~800–1800 words of high-value content.")
+    elif wc <= 800:
+        depth = 0.6; recs.append("Deepen topical coverage with examples, data, FAQs.")
+    elif wc <= 3000:
+        depth = 1.0
+    else:
+        depth = 0.9
+    pts += depth * weights["content_depth"]
+
+    fre = s.get("reading_ease",0)
+    if fre < 30:
+        rscore=0.2; recs.append("Improve readability (shorter sentences, subheadings, bullets).")
+    elif fre < 40: rscore=0.5
+    elif fre <= 80: rscore=1.0
+    elif fre <= 90: rscore=0.8
+    else: rscore=0.6
+    pts += rscore * weights["readability"]
+
+    evergreen = 0.2 if (s.get("url_has_year") or s.get("url_has_date")) else 1.0
+    if evergreen < 1.0: recs.append("Prefer evergreen URLs (avoid embedding years/dates in path).")
+    pts += evergreen * weights["url_evergreen"]
+
+    # NEW: Lead priority
+    lead = s.get("lead_score",0.0)
+    pts += lead * weights["lead_priority"]
+    if lead < 0.6: recs.append("Open with the most important info: summarize key entities, numbers, and answers in the first ~150 words.")
+
+    # Links/media (p-only)
+    intern = len(s.get("p_internal_links",[]))
+    extern = len(s.get("p_external_links",[]))
+    if intern == 0:
+        il=0.0; recs.append("Add contextual internal links inside body copy (aim 3–15).")
+    elif intern < 3:
+        il=0.6; recs.append("Add a few more internal links in paragraphs.")
+    elif intern <= 20:
+        il=1.0
+    else: il=0.9
+    pts += il * weights["internal_links"]
+
+    if extern == 0:
+        el=0.0; recs.append("Cite reputable external sources (1–10) inside body copy.")
+    elif extern <= 10:
+        el=1.0
+    else: el=0.8
+    pts += el * weights["external_links"]
+
+    alt_pct = s.get("img_alt_pct",0.0)
+    ia = 1.0 if alt_pct>=0.9 else 0.8 if alt_pct>=0.6 else 0.5 if alt_pct>0 else 0.0
+    if alt_pct < 0.6: recs.append("Improve image alt coverage (aim >60%).")
+    pts += ia * weights["image_alts"]
+
+    iaq = s.get("internal_anchor_quality",0.0)
+    pts += iaq * weights["internal_anchor_quality"]
+    if iaq < 0.7: recs.append("Use descriptive internal anchor text (avoid ‘click here’; use 3+ meaningful words).")
+
+    isem = s.get("internal_semantic_score",0.0)
+    pts += isem * weights["internal_semantic"]
+    if isem < 0.6: recs.append("Link to semantically related internal URLs (match slugs to the page’s key entities/topics).")
+
+    # E-E-A-T proxies
+    ap = 1.0 if s.get("author_present") else 0.0
+    if ap==0.0: recs.append("Add clear author attribution with credentials and an author page.")
+    pts += ap * weights["author"]
+
+    org = 1.0 if s.get("org_schema") else 0.0
+    per = 1.0 if s.get("person_schema") else 0.0
+    jsonld = 1.0 if s.get("jsonld_present") else 0.0
+    if org==0.0: recs.append("Add Organization schema (name, logo, sameAs).")
+    if per==0.0: recs.append("Add Person schema for the
