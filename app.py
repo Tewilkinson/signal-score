@@ -639,8 +639,8 @@ def fetch_pagespeed(url: str, api_key: str | None):
     base = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
     error_msg = None
 
-    def _call(strategy: str):
-        params = {"url": url, "strategy": strategy, "category": "PERFORMANCE"}
+    def _call(strategy: str, target_url: str | None = None):
+        params = {"url": (target_url or url), "strategy": strategy, "category": "PERFORMANCE"}
         if api_key:
             params["key"] = api_key.strip()
         last_exc = None
@@ -667,9 +667,9 @@ def fetch_pagespeed(url: str, api_key: str | None):
     data = None
     try:
         # Try mobile first, then desktop fallback
-        data = _call("mobile")
+        data = _call("mobile", url)
         if not data.get("lighthouseResult"):
-            data = _call("desktop")
+            data = _call("desktop", url)
     except Exception as e:
         error_msg = str(e)
         # If Lighthouse failed to load the document, try origin-level field data as a best-effort fallback
@@ -678,9 +678,9 @@ def fetch_pagespeed(url: str, api_key: str | None):
             from urllib.parse import urlparse, urlunparse
             p = urlparse(url)
             origin_url = urlunparse((p.scheme or "https", p.netloc, "/", "", "", ""))
-            data_origin = _call("mobile") if origin_url == url else _call("mobile")
+            data_origin = _call("mobile", origin_url)
             # If origin call succeeded, capture field metrics even if we mark ok False
-            le = data_origin.get("loadingExperience", {}) or data_origin.get("originLoadingExperience", {})
+            le = data_origin.get("originLoadingExperience", {}) or data_origin.get("loadingExperience", {})
             metrics = le.get("metrics", {})
             def p75(id_):
                 m = metrics.get(id_, {})
