@@ -565,26 +565,10 @@ def extract_ldjson(soup: BeautifulSoup):
     return blobs
 
 def extract_main_content(soup: BeautifulSoup):
-    # Prefer content injected during JS rendering
-    special = soup.select("[data-readability='1'], [data-visible-text='1'], [data-ss-iframe-article='1']")
-    if special:
-        container = soup.new_tag("div")
-        for node in special:
-            container.append(node)
-        return container
-    # Otherwise, pick the best large text container that's not nav-like
-    candidates = soup.find_all(["article", "main", "div", "section"])
-    def score_node(node):
-        txt_len = len(node.get_text(" ", strip=True))
-        cls = " ".join(node.get("class") or [])
-        pid = node.get("id") or ""
-        if NAV_LIKE.search(cls) or NAV_LIKE.search(pid):
-            return -1
-        return txt_len
+    candidates = soup.find_all(["article", "main"])
     if candidates:
-        best = max(candidates, key=score_node)
-        if score_node(best) > 0:
-            return best
+        best = max(candidates, key=lambda c: len(c.get_text(" ", strip=True)))
+        return best
     body = soup.body or soup
     # strip obvious nav/footer/aside
     for tag in body.find_all(["nav","footer","aside"]):
@@ -1433,7 +1417,7 @@ with st.sidebar:
 
     js = st.checkbox("Enable JavaScript rendering (manual boost)", value=False,
                      help="The app auto-detects CSR pages and renders JS anyway. Enable to force JS render early.")
-    aggressive = st.checkbox("Aggressive rendering (stealth + Readability)", value=True,
+    aggressive = st.checkbox("Aggressive rendering (stealth + Readability)", value=False,
                              help="Use anti-bot tweaks, longer waits, and Readability extraction for hard pages.")
     wait_selector = st.text_input("Wait for selector (optional)",
                                   help="CSS selector(s), comma or line separated, to wait for before snapshot. Example: main article, .markdown-body")
