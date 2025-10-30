@@ -637,19 +637,37 @@ def extract_text_blocks(node):
 # ------------- PageSpeed Insights (CWV) -------------
 def fetch_pagespeed(url: str, api_key: str | None):
     base = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
-    params = {"url": url, "strategy": "mobile", "category": "PERFORMANCE"}
-    if api_key:
-        params["key"] = api_key.strip()
-    try:
+    error_msg = None
+
+    def _call(strategy: str):
+        params = {"url": url, "strategy": strategy, "category": "PERFORMANCE"}
+        if api_key:
+            params["key"] = api_key.strip()
         r = requests.get(base, params=params, timeout=30)
         r.raise_for_status()
-        data = r.json()
-    except Exception:
-        return {"ok": False}
+        return r.json()
+
+    data = None
+    try:
+        # Try mobile first, then desktop fallback
+        data = _call("mobile")
+        if not data.get("lighthouseResult"):
+            data = _call("desktop")
+    except Exception as e:
+        error_msg = str(e)
+        return {"ok": False, "error": error_msg}
+
+    if not data:
+        return {"ok": False, "error": "empty_response"}
 
     out = {"ok": True}
     try:
         lh = data.get("lighthouseResult", {})
+        if not lh:
+            # If PSI returns an API error payload, surface it
+            out["ok"] = False
+            out["error"] = data.get("error", {}).get("message") or "no_lighthouse_result"
+            return out
         cats = lh.get("categories", {})
         out["perf_score"] = cats.get("performance", {}).get("score", None)
         audits = lh.get("audits", {})
@@ -664,8 +682,8 @@ def fetch_pagespeed(url: str, api_key: str | None):
             "TTI_ms": val("interactive"),
             "TBT_ms": val("total-blocking-time"),
         }
-    except Exception:
-        pass
+    except Exception as e:
+        error_msg = str(e)
 
     try:
         le = data.get("loadingExperience", {})
@@ -681,6 +699,10 @@ def fetch_pagespeed(url: str, api_key: str | None):
         }
     except Exception:
         pass
+
+    if error_msg and out.get("ok") is True and (out.get("perf_score") is None):
+        out["ok"] = False
+        out["error"] = error_msg
     return out
 
 def normalize_ms(value, good, poor):
@@ -1043,7 +1065,7 @@ def analyze_url(url: str, use_js=False, exclude_toc=True, require_nonempty_ancho
     # ----- PageSpeed / CWV -----
     secrets_key = st.secrets.get("PAGESPEED_API_KEY")
     attempt_psi = bool(secrets_key) or want_psi
-    psi = fetch_pagespeed(url, secrets_key or (psi_key if attempt_psi else None)) if attempt_psi else {"ok": False}
+    psi = fetch_pagespeed(url, secrets_key or (psi_key if attempt_psi else None)) if attempt_psi else {"ok": False, "error": "psi_disabled"}
 
     lab_perf = psi.get("perf_score", None) if psi.get("ok") else None
     lab_LCP = psi.get("lab",{}).get("LCP_ms") if psi.get("ok") else None
@@ -1078,6 +1100,7 @@ def analyze_url(url: str, use_js=False, exclude_toc=True, require_nonempty_ancho
         "inline_scripts": inline_scripts,
         "did_js": did_js,
         "renderer": renderer,
+        "psi_error": psi.get("error") if not psi.get("ok") else None,
     }
 
     # ----- Keyword Relevance -----
@@ -1537,3 +1560,4 @@ if run:
         })
 else:
     st.info("Enter a URL + optional target keywords in the sidebar and click **Run Analysis**.")
+
