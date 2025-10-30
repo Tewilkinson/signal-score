@@ -644,7 +644,15 @@ def fetch_pagespeed(url: str, api_key: str | None):
         if api_key:
             params["key"] = api_key.strip()
         r = requests.get(base, params=params, timeout=30)
-        r.raise_for_status()
+        try:
+            r.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            try:
+                err = r.json().get("error", {})
+                msg = err.get("message") or r.text
+            except Exception:
+                msg = r.text
+            raise requests.exceptions.HTTPError(f"{e}: {msg}")
         return r.json()
 
     data = None
@@ -1560,4 +1568,3 @@ if run:
         })
 else:
     st.info("Enter a URL + optional target keywords in the sidebar and click **Run Analysis**.")
-
