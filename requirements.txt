@@ -4,5 +4,4 @@ beautifulsoup4==4.12.3
 nest-asyncio==1.6.0
 openai==1.44.1
 tqdm==4.66.5
-pyppeteer==2.0.0
-websockets==12.0
+
