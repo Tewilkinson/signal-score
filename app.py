@@ -1263,7 +1263,7 @@ def score_page(s: dict):
     if alt_pct < 0.6: recs.append("Improve image alt coverage (aim >60%).")
 
     iaq = s.get("internal_anchor_quality",0.0)
-    if iaq < 0.7: recs.append("Use descriptive internal anchor text (avoid ‘click here’; use 3+ meaningful words).")
+    if iaq < 0.7: recs.append("Use descriptive internal anchor text (avoid 'click here'; use 3+ meaningful words).")
 
     isem = s.get("internal_semantic_score",0.0)
     if isem < 0.6: recs.append("Link to semantically related internal URLs (align slugs with key entities/topics).")
@@ -1316,7 +1316,7 @@ def score_page(s: dict):
 
     # --- Freshness / Canonical (recommendations only) ---
     mp = s.get("months_since_pub", math.inf)
-    if mp > 24: recs.append("Refresh old content or add a clear ‘last updated’ if materially revised.")
+    if mp > 24: recs.append("Refresh old content or add a clear 'last updated' if materially revised.")
     mm = s.get("months_since_mod", math.inf)
     if not math.isinf(mm) and mm > 12: recs.append("Make a meaningful update and surface the modified date.")
     if not s.get("canonical"): recs.append("Declare a canonical URL.")
