@@ -643,17 +643,26 @@ def fetch_pagespeed(url: str, api_key: str | None):
         params = {"url": url, "strategy": strategy, "category": "PERFORMANCE"}
         if api_key:
             params["key"] = api_key.strip()
-        r = requests.get(base, params=params, timeout=30)
-        try:
-            r.raise_for_status()
-        except requests.exceptions.HTTPError as e:
+        last_exc = None
+        for attempt in range(3):
             try:
-                err = r.json().get("error", {})
-                msg = err.get("message") or r.text
-            except Exception:
-                msg = r.text
-            raise requests.exceptions.HTTPError(f"{e}: {msg}")
-        return r.json()
+                r = requests.get(base, params=params, timeout=60)
+                try:
+                    r.raise_for_status()
+                except requests.exceptions.HTTPError as e:
+                    try:
+                        err = r.json().get("error", {})
+                        msg = err.get("message") or r.text
+                    except Exception:
+                        msg = r.text
+                    raise requests.exceptions.HTTPError(f"{e}: {msg}")
+                return r.json()
+            except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as e:
+                last_exc = e
+                # simple backoff
+                time.sleep(1.5 * (attempt + 1))
+                continue
+        raise requests.exceptions.RequestException(f"PSI request failed after retries: {last_exc}")
 
     data = None
     try:
@@ -663,7 +672,31 @@ def fetch_pagespeed(url: str, api_key: str | None):
             data = _call("desktop")
     except Exception as e:
         error_msg = str(e)
-        return {"ok": False, "error": error_msg}
+        # If Lighthouse failed to load the document, try origin-level field data as a best-effort fallback
+        origin_field = None
+        try:
+            from urllib.parse import urlparse, urlunparse
+            p = urlparse(url)
+            origin_url = urlunparse((p.scheme or "https", p.netloc, "/", "", "", ""))
+            data_origin = _call("mobile") if origin_url == url else _call("mobile")
+            # If origin call succeeded, capture field metrics even if we mark ok False
+            le = data_origin.get("loadingExperience", {}) or data_origin.get("originLoadingExperience", {})
+            metrics = le.get("metrics", {})
+            def p75(id_):
+                m = metrics.get(id_, {})
+                p_ = m.get("percentile")
+                return float(p_) if p_ is not None else None
+            origin_field = {
+                "LCP_ms_p75": p75("LARGEST_CONTENTFUL_PAINT_MS"),
+                "CLS_p75": metrics.get("CUMULATIVE_LAYOUT_SHIFT_SCORE", {}).get("percentile", None),
+                "INP_ms_p75": p75("INTERACTION_TO_NEXT_PAINT"),
+            }
+        except Exception:
+            pass
+        out_err = {"ok": False, "error": error_msg}
+        if origin_field:
+            out_err["field"] = origin_field
+        return out_err
 
     if not data:
         return {"ok": False, "error": "empty_response"}
@@ -1109,6 +1142,7 @@ def analyze_url(url: str, use_js=False, exclude_toc=True, require_nonempty_ancho
         "did_js": did_js,
         "renderer": renderer,
         "psi_error": psi.get("error") if not psi.get("ok") else None,
+        "psi_attempted": True if want_psi else False,
     }
 
     # ----- Keyword Relevance -----
