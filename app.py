@@ -452,18 +452,22 @@ async def _pyppeteer_render_aggressive(url: str, timeout=70, scroll_steps=14, wa
         except Exception:
             pass
 
-        # If still looks empty by word-count, append a visible text snapshot
+        # If still looks empty by word-count, append a visible text snapshot limited to main content areas
         try:
             await page.evaluate("""
                 try {
-                    const text = Array.from(document.querySelectorAll('body *'))
+                    const roots = document.querySelectorAll('main, article, [role="main"], .content, .entry-content');
+                    const scopes = roots.length ? Array.from(roots) : [document.body];
+                    const collect = (root) => Array.from(root.querySelectorAll('*'))
                         .filter(el => {
+                            if (el.closest('nav, header, footer, aside')) return false;
                             const style = window.getComputedStyle(el);
                             return style && style.display !== 'none' && style.visibility !== 'hidden';
                         })
                         .map(el => el.innerText)
                         .filter(Boolean)
                         .join(' ');
+                    const text = scopes.map(collect).join(' ');
                     if ((text.split(/\s+/).filter(w=>w.length>2).length) < 80) return;
                     const vis = document.createElement('div');
                     vis.setAttribute('data-visible-text', '1');
@@ -824,11 +828,22 @@ def analyze_url(url: str, use_js=False, exclude_toc=True, require_nonempty_ancho
     main = extract_main_content(soup)
     text_blocks = extract_text_blocks(main)
     full_text = clean_text(" ".join(text_blocks))
-    # Fallback: if structured blocks were sparse, use entire body text
+    # Fallback: if structured blocks were sparse, use a nav/footer/aside stripped body clone
     if len(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", full_text)) < 80:
-        body_all = clean_text((soup.body.get_text(" ", strip=True) if soup.body else ""))
-        if len(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", body_all)) > len(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", full_text)):
-            full_text = body_all
+        try:
+            body_clone = BeautifulSoup(str(soup.body or soup), "html.parser")
+            # Remove global chrome and nav-like sections
+            for tag in body_clone.find_all(["nav","footer","aside","header"]):
+                tag.extract()
+            for tag in body_clone.find_all(True, class_=NAV_LIKE):
+                tag.extract()
+            for c in body_clone.find_all(string=lambda t: isinstance(t, Comment)):
+                c.extract()
+            body_all = clean_text(body_clone.get_text(" ", strip=True))
+            if len(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", body_all)) > len(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", full_text)):
+                full_text = body_all
+        except Exception:
+            pass
     word_count = len(re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ]+", full_text))
     reading_ease = flesch_reading_ease(full_text)
 
